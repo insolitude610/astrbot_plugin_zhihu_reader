@@ -4,6 +4,17 @@
 
 ## [未发布]
 
+## [0.1.1] - 2026-07-22
+
+### 修复
+
+- 读取问题链接时，在单链接评论总预算内抓取已选高赞回答的评论，而不再只读取问题本身的评论。
+- 默认排序没有返回评论但知乎仍报告存在评论时，自动改按最新排序重试一次。
+- 按 `paging.next` 中的不透明游标读取根评论和子评论后续页，避免数字 offset 导致重复首屏或漏读。
+- 配置 Cookie 导致公开评论接口返回 401/403 时，自动清空 Cookie 匿名重试一次。
+- 评论接口被拒绝、限流或返回异常结构时保留已抓取的正文与部分评论，并向大模型提供明确的不可用原因。
+- 不再把评论读取失败的结果缓存为正常的“无评论”内容。
+
 ## [0.1.0] - 2026-07-22
 
 ### 新增
@@ -19,5 +30,6 @@
 - 将知乎内容标记为外部不可信资料，降低其中提示词影响模型指令的风险。
 - 避免在日志和公开仓库中记录可选的知乎 Cookie。
 
-[未发布]: https://github.com/insolitude610/astrbot_plugin_zhihu_reader/compare/v0.1.0...HEAD
+[未发布]: https://github.com/insolitude610/astrbot_plugin_zhihu_reader/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/insolitude610/astrbot_plugin_zhihu_reader/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/insolitude610/astrbot_plugin_zhihu_reader/releases/tag/v0.1.0

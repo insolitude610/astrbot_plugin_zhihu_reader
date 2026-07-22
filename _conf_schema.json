@@ -16,13 +16,13 @@
     "description": "读取评论",
     "type": "bool",
     "default": true,
-    "hint": "同时抓取当前文章、问题或回答下的评论。"
+    "hint": "同时抓取当前文章、问题或回答下的评论；读取问题链接时，也会在总数量上限内抓取已选高赞回答的评论。"
   },
   "max_comments": {
     "description": "单个链接最多读取的评论数",
     "type": "int",
     "default": 10,
-    "hint": "运行时限制为 0-50；设为 0 时不读取评论。"
+    "hint": "单个链接的评论总预算，运行时限制为 0-50；设为 0 时不读取评论。"
   },
   "max_content_chars": {
     "description": "单个链接的正文字符上限",

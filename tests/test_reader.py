@@ -81,8 +81,8 @@ class ParseZhihuUrlTests(unittest.TestCase):
 
 class ZhihuReaderTests(unittest.IsolatedAsyncioTestCase):
     async def test_reads_answer_and_bounded_nested_comments(self) -> None:
-        root_offsets: list[int] = []
-        child_offsets: list[int] = []
+        root_offsets: list[str] = []
+        child_offsets: list[str] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
             self.assertEqual(request.url.host, "www.zhihu.com")
@@ -107,10 +107,10 @@ class ZhihuReaderTests(unittest.IsolatedAsyncioTestCase):
                 request.url.path
                 == "/api/v4/comment_v5/answers/456/root_comment"
             ):
-                offset = int(request.url.params["offset"])
+                offset = request.url.params["offset"]
                 root_offsets.append(offset)
                 self.assertEqual(request.url.params["order_by"], "score")
-                if offset == 0:
+                if offset == "0":
                     return json_response(
                         {
                             "data": [
@@ -120,7 +120,8 @@ class ZhihuReaderTests(unittest.IsolatedAsyncioTestCase):
                                     "content": "<p>Root comment</p>",
                                     "like_count": 5,
                                     "created_time": 1_700_000_200,
-                                    "child_comment_count": 2,
+                                    "child_comment_count": 3,
+                                    "child_comment_next_offset": "embedded_cursor",
                                     "child_comments": [
                                         {
                                             "id": 101,
@@ -132,12 +133,24 @@ class ZhihuReaderTests(unittest.IsolatedAsyncioTestCase):
                                     ],
                                 }
                             ],
-                            "paging": {"is_end": False, "next": "https://evil.test/"},
+                            "paging": {
+                                "is_end": False,
+                                "next": (
+                                    "https://www.zhihu.com/api/v4/comment_v5/"
+                                    "answers/456/root_comment?limit=5&offset="
+                                    "root_cursor&order_by=score"
+                                ),
+                            },
                         }
                     )
                 return json_response(
                     {
                         "data": [
+                            {
+                                "id": 100,
+                                "member": {"name": "Root user"},
+                                "content": "<p>Root comment</p>",
+                            },
                             {
                                 "id": 200,
                                 "author": {"name": "Second root"},
@@ -152,21 +165,37 @@ class ZhihuReaderTests(unittest.IsolatedAsyncioTestCase):
                 request.url.path
                 == "/api/v4/comment_v5/comment/100/child_comment"
             ):
-                child_offsets.append(int(request.url.params["offset"]))
+                offset = request.url.params["offset"]
+                child_offsets.append(offset)
+                if offset == "embedded_cursor":
+                    return json_response(
+                        {
+                            "data": [
+                                {
+                                    "id": 102,
+                                    "member": {"name": "Child two"},
+                                    "content": "<p>Second reply</p>",
+                                    "like_count": 1,
+                                }
+                            ],
+                            "paging": {
+                                "is_end": False,
+                                "next": (
+                                    "https://www.zhihu.com/api/v4/comment_v5/"
+                                    "comment/100/child_comment?limit=2&offset="
+                                    "child_cursor"
+                                ),
+                            },
+                        }
+                    )
                 return json_response(
                     {
                         "data": [
                             {
-                                "id": 101,
-                                "author": {"member": {"name": "Child one"}},
-                                "content": "<p>First reply</p>",
-                            },
-                            {
-                                "id": 102,
-                                "member": {"name": "Child two"},
-                                "content": "<p>Second reply</p>",
-                                "like_count": 1,
-                            },
+                                "id": 103,
+                                "member": {"name": "Child three"},
+                                "content": "<p>Third reply</p>",
+                            }
                         ],
                         "paging": {"is_end": True},
                     }
@@ -179,11 +208,11 @@ class ZhihuReaderTests(unittest.IsolatedAsyncioTestCase):
                 client=client,
                 cookie="z_c0=test-cookie",
                 max_comments=50,
-                max_child_comments=2,
+                max_child_comments=3,
                 max_comment_pages=3,
             )
             result = await reader.read(
-                "https://www.zhihu.com/question/123/answer/456", max_comments=4
+                "https://www.zhihu.com/question/123/answer/456", max_comments=5
             )
 
         self.assertIn("[Zhihu answer]", result)
@@ -191,14 +220,19 @@ class ZhihuReaderTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Hello world.", result)
         self.assertIn("Second\nline", result)
         self.assertIn("Root comment", result)
+        self.assertEqual(result.count("Root comment"), 1)
         self.assertIn("First reply", result)
         self.assertIn("Second reply", result)
+        self.assertIn("Third reply", result)
         self.assertIn("Another comment", result)
-        self.assertEqual(root_offsets, [0, 1])
-        self.assertEqual(child_offsets, [0])
+        self.assertEqual(root_offsets, ["0", "root_cursor"])
+        self.assertEqual(child_offsets, ["embedded_cursor", "child_cursor"])
 
     async def test_comment_api_error_does_not_drop_answer_body(self) -> None:
+        comment_calls = 0
+
         def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal comment_calls
             if request.url.path == "/api/v4/answers/456":
                 return json_response(
                     {
@@ -208,6 +242,7 @@ class ZhihuReaderTests(unittest.IsolatedAsyncioTestCase):
                     }
                 )
             if request.url.path.endswith("/root_comment"):
+                comment_calls += 1
                 return json_response({}, status_code=403)
             return json_response({}, status_code=404)
 
@@ -216,9 +251,13 @@ class ZhihuReaderTests(unittest.IsolatedAsyncioTestCase):
         ) as client:
             reader = ZhihuReader(client=client, max_comments=10)
             result = await reader.read("https://www.zhihu.com/answer/456")
+            second = await reader.read("https://www.zhihu.com/answer/456")
 
         self.assertIn("The answer body remains available.", result)
         self.assertNotIn("Comments captured:", result)
+        self.assertIn("Comments unavailable: Zhihu denied access", result)
+        self.assertEqual(result, second)
+        self.assertEqual(comment_calls, 2)
 
     async def test_child_comment_error_keeps_root_comment(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
@@ -256,6 +295,170 @@ class ZhihuReaderTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("Root stays", result)
         self.assertNotIn("Reply -", result)
+        self.assertIn("Comments partially unavailable: Zhihu denied access", result)
+
+    async def test_denied_cookie_retries_public_comments_anonymously(self) -> None:
+        comment_cookies: list[str | None] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/api/v4/answers/456":
+                return json_response(
+                    {
+                        "question": {"title": "Readable answer"},
+                        "content": "<p>Body</p>",
+                        "comment_count": 1,
+                    }
+                )
+            if request.url.path.endswith("/root_comment"):
+                cookie = request.headers.get("cookie")
+                comment_cookies.append(cookie)
+                if cookie:
+                    return json_response({}, status_code=401)
+                return json_response(
+                    {
+                        "data": [
+                            {
+                                "id": 100,
+                                "member": {"name": "Public commenter"},
+                                "content": "<p>Public comment</p>",
+                            }
+                        ],
+                        "paging": {"is_end": True},
+                    }
+                )
+            return json_response({}, status_code=404)
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            cookies={"z_c0": "jar-cookie"},
+        ) as client:
+            reader = ZhihuReader(
+                client=client,
+                cookie="z_c0=expired-cookie",
+                max_comments=10,
+            )
+            result = await reader.read("https://www.zhihu.com/answer/456")
+
+        self.assertEqual(comment_cookies, ["z_c0=expired-cookie", ""])
+        self.assertIn("Public comment", result)
+        self.assertNotIn("Comments unavailable:", result)
+
+    async def test_unsafe_comment_cursor_keeps_partial_result_uncached(self) -> None:
+        comment_calls = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal comment_calls
+            self.assertEqual(request.url.host, "www.zhihu.com")
+            if request.url.path == "/api/v4/answers/456":
+                return json_response(
+                    {
+                        "question": {"title": "Readable answer"},
+                        "content": "<p>Body</p>",
+                        "comment_count": 2,
+                    }
+                )
+            if request.url.path.endswith("/root_comment"):
+                comment_calls += 1
+                return json_response(
+                    {
+                        "data": [
+                            {
+                                "id": 100,
+                                "member": {"name": "First commenter"},
+                                "content": "<p>First comment remains</p>",
+                            }
+                        ],
+                        "paging": {
+                            "is_end": False,
+                            "next": (
+                                "https://attacker.example/api/v4/comment_v5/"
+                                "answers/456/root_comment?offset=stolen"
+                            ),
+                        },
+                    }
+                )
+            return json_response({}, status_code=404)
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
+            reader = ZhihuReader(client=client, max_comments=10)
+            first = await reader.read("https://www.zhihu.com/answer/456")
+            second = await reader.read("https://www.zhihu.com/answer/456")
+
+        self.assertEqual(first, second)
+        self.assertEqual(comment_calls, 2)
+        self.assertIn("First comment remains", first)
+        self.assertIn("Comments partially unavailable:", first)
+        self.assertIn("did not provide a safe next cursor", first)
+
+    async def test_empty_score_order_retries_latest_comments(self) -> None:
+        requests: list[tuple[str, str]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/api/v4/answers/456":
+                return json_response(
+                    {
+                        "question": {"title": "Readable answer"},
+                        "content": "<p>Body</p>",
+                        "comment_count": 0,
+                    }
+                )
+            if request.url.path.endswith("/root_comment"):
+                order = request.url.params["order_by"]
+                offset = request.url.params["offset"]
+                requests.append((order, offset))
+                if order == "score":
+                    return json_response(
+                        {"data": [], "paging": {"is_end": True}}
+                    )
+                if offset == "0":
+                    return json_response(
+                        {
+                            "data": [
+                                {
+                                    "id": 100,
+                                    "member": {"name": "Latest user"},
+                                    "content": "<p>Latest comment</p>",
+                                }
+                            ],
+                            "paging": {
+                                "is_end": False,
+                                "next": (
+                                    "https://www.zhihu.com/api/v4/comment_v5/"
+                                    "answers/456/root_comment?limit=10&offset="
+                                    "latest_cursor&order_by=ts"
+                                ),
+                            },
+                        }
+                    )
+                return json_response(
+                    {
+                        "data": [
+                            {
+                                "id": 101,
+                                "member": {"name": "Second latest user"},
+                                "content": "<p>Second latest comment</p>",
+                            }
+                        ],
+                        "paging": {"is_end": True},
+                    }
+                )
+            return json_response({}, status_code=404)
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
+            reader = ZhihuReader(client=client, max_comments=10)
+            result = await reader.read("https://www.zhihu.com/answer/456")
+
+        self.assertEqual(
+            requests,
+            [("score", "0"), ("ts", "0"), ("ts", "latest_cursor")],
+        )
+        self.assertIn("Latest comment", result)
+        self.assertIn("Second latest comment", result)
+        self.assertNotIn("Comments unavailable:", result)
 
     async def test_long_answer_preserves_comment_budget(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
@@ -338,6 +541,127 @@ class ZhihuReaderTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Question detail", result)
         self.assertLess(result.index("Author: High"), result.index("Author: Low"))
         self.assertIn("Upvotes: 200", result)
+
+    async def test_question_reads_comments_for_captured_answers(self) -> None:
+        comment_paths: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/api/v4/questions/321":
+                return json_response(
+                    {
+                        "title": "Question with answer comments",
+                        "answer_count": 2,
+                        "comment_count": 0,
+                    }
+                )
+            if request.url.path == "/api/v4/questions/321/answers":
+                return json_response(
+                    {
+                        "data": [
+                            {
+                                "id": 10,
+                                "author": {"name": "High"},
+                                "content": "<p>High answer</p>",
+                                "voteup_count": 100,
+                                "comment_count": 2,
+                            },
+                            {
+                                "id": 20,
+                                "author": {"name": "Low"},
+                                "content": "<p>Low answer</p>",
+                                "voteup_count": 10,
+                                "comment_count": 0,
+                            },
+                        ]
+                    }
+                )
+            if request.url.path.endswith("/root_comment"):
+                comment_paths.append(request.url.path)
+                resource_id = request.url.path.split("/")[-2]
+                return json_response(
+                    {
+                        "data": [
+                            {
+                                "id": int(resource_id) + 100,
+                                "member": {"name": f"Commenter {resource_id}"},
+                                "content": f"<p>Comment for {resource_id}</p>",
+                            }
+                        ],
+                        "paging": {"is_end": True},
+                    }
+                )
+            return json_response({}, status_code=404)
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
+            reader = ZhihuReader(
+                client=client,
+                max_comments=3,
+                max_question_answers=2,
+            )
+            result = await reader.read("https://www.zhihu.com/question/321")
+
+        self.assertEqual(
+            comment_paths,
+            [
+                "/api/v4/comment_v5/answers/10/root_comment",
+                "/api/v4/comment_v5/answers/20/root_comment",
+                "/api/v4/comment_v5/questions/321/root_comment",
+            ],
+        )
+        self.assertIn("Answer 1 comments captured: 1", result)
+        self.assertIn("Comment for 10", result)
+        self.assertIn("Answer 2 comments captured: 1", result)
+        self.assertIn("Comment for 20", result)
+        self.assertIn("Question comments captured: 1", result)
+        self.assertIn("Comment for 321", result)
+
+    async def test_question_missing_answer_id_is_diagnostic_and_uncached(self) -> None:
+        question_calls = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal question_calls
+            if request.url.path == "/api/v4/questions/321":
+                question_calls += 1
+                return json_response(
+                    {
+                        "title": "Question with incomplete answer metadata",
+                        "answer_count": 1,
+                        "comment_count": 0,
+                    }
+                )
+            if request.url.path == "/api/v4/questions/321/answers":
+                return json_response(
+                    {
+                        "data": [
+                            {
+                                "author": {"name": "Missing ID"},
+                                "content": "<p>Readable answer</p>",
+                                "comment_count": 0,
+                            }
+                        ]
+                    }
+                )
+            if request.url.path.endswith("/root_comment"):
+                return json_response(
+                    {"data": [], "paging": {"is_end": True}}
+                )
+            return json_response({}, status_code=404)
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
+            reader = ZhihuReader(client=client, max_comments=2)
+            first = await reader.read("https://www.zhihu.com/question/321")
+            second = await reader.read("https://www.zhihu.com/question/321")
+
+        self.assertEqual(first, second)
+        self.assertEqual(question_calls, 2)
+        self.assertIn(
+            "Answer 1 comments unavailable: Zhihu omitted the answer ID.",
+            first,
+        )
 
     async def test_article_uses_excerpt_when_content_is_empty(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:

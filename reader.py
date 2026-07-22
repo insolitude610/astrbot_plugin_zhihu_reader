@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from typing import Any, Callable, Literal, Mapping
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import httpx
 
 
+_LOGGER = logging.getLogger(__name__)
 _API_ORIGIN = "https://www.zhihu.com"
 _SUPPORTED_HOSTS = {"zhihu.com", "www.zhihu.com", "zhuanlan.zhihu.com"}
 _RESOURCE_ID = r"([1-9]\d{0,29})"
@@ -39,6 +42,10 @@ class InvalidZhihuUrlError(ZhihuReaderError, ValueError):
 
 class ZhihuRequestError(ZhihuReaderError):
     """Raised when Zhihu cannot be queried safely or successfully."""
+
+
+class _ZhihuAccessDeniedError(ZhihuRequestError):
+    """Raised when Zhihu rejects the current authentication state."""
 
 
 class ZhihuDocument(str):
@@ -87,6 +94,22 @@ class _Comment:
     votes: int
     created_at: str
     children: tuple[_Comment, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _CommentsResult:
+    comments: tuple[_Comment, ...] = ()
+    error: str | None = None
+
+    @property
+    def captured_count(self) -> int:
+        return sum(1 + len(comment.children) for comment in self.comments)
+
+
+@dataclass(frozen=True, slots=True)
+class _RenderedDocument:
+    text: str
+    comments_complete: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -396,14 +419,14 @@ class ZhihuReader:
             self._cache.pop(cache_key, None)
 
         if target.kind == "answer":
-            result = await self._read_answer(target, comment_limit)
+            rendered = await self._read_answer(target, comment_limit)
         elif target.kind == "article":
-            result = await self._read_article(target, comment_limit)
+            rendered = await self._read_article(target, comment_limit)
         else:
-            result = await self._read_question(target, comment_limit)
+            rendered = await self._read_question(target, comment_limit)
 
-        result = self._truncate(result)
-        if self._cache_ttl_seconds > 0:
+        result = self._truncate(rendered.text)
+        if self._cache_ttl_seconds > 0 and rendered.comments_complete:
             expired_keys = [
                 key for key, entry in self._cache.items() if entry.expires_at <= now
             ]
@@ -421,7 +444,11 @@ class ZhihuReader:
         return ZhihuDocument(result)
 
     async def _fetch_json(
-        self, endpoint: str, *, params: Mapping[str, object] | None = None
+        self,
+        endpoint: str,
+        *,
+        params: Mapping[str, object] | None = None,
+        headers: Mapping[str, str] | None = None,
     ) -> dict[str, Any]:
         if not any(pattern.fullmatch(endpoint) for pattern in _SAFE_API_ENDPOINTS):
             raise ZhihuRequestError("An unsafe Zhihu API endpoint was rejected.")
@@ -432,7 +459,7 @@ class ZhihuReader:
                 "GET",
                 request_url,
                 params=params,
-                headers=self._headers,
+                headers=self._headers if headers is None else headers,
                 timeout=self._timeout,
                 follow_redirects=False,
             ) as response:
@@ -441,7 +468,7 @@ class ZhihuReader:
                         "Zhihu returned an unexpected redirect; it was not followed."
                     )
                 if response.status_code in {401, 403}:
-                    raise ZhihuRequestError(
+                    raise _ZhihuAccessDeniedError(
                         "Zhihu denied access. Configure a valid Cookie and try again."
                     )
                 if response.status_code == 404:
@@ -497,7 +524,34 @@ class ZhihuReader:
             raise ZhihuRequestError("Zhihu returned an unexpected JSON structure.")
         return payload
 
-    async def _read_answer(self, target: ZhihuTarget, comment_limit: int) -> str:
+    async def _fetch_comment_json(
+        self,
+        endpoint: str,
+        *,
+        params: Mapping[str, object] | None = None,
+    ) -> dict[str, Any]:
+        """Fetch a comment page, retrying public comments without a bad Cookie."""
+        try:
+            return await self._fetch_json(endpoint, params=params)
+        except _ZhihuAccessDeniedError:
+            has_client_cookies = any(True for _ in self._client.cookies.jar)
+            if not self._headers.get("Cookie") and not has_client_cookies:
+                raise
+            anonymous_headers = dict(self._headers)
+            anonymous_headers["Cookie"] = ""
+            _LOGGER.info(
+                "Zhihu comment request for %s was denied; retrying anonymously",
+                endpoint,
+            )
+            return await self._fetch_json(
+                endpoint,
+                params=params,
+                headers=anonymous_headers,
+            )
+
+    async def _read_answer(
+        self, target: ZhihuTarget, comment_limit: int
+    ) -> _RenderedDocument:
         payload = await self._fetch_json(
             f"/api/v4/answers/{target.resource_id}",
             params={
@@ -515,15 +569,19 @@ class ZhihuReader:
         question_data = question if isinstance(question, Mapping) else {}
         title = html_to_text(question_data.get("title")) or "Untitled question"
         author = self._author_name(payload.get("author"))
+        reported_comments = self._integer(payload.get("comment_count"))
         comments = await self._safe_comments(
-            "answer", target.resource_id, comment_limit
+            "answer",
+            target.resource_id,
+            comment_limit,
+            expected_count=reported_comments,
         )
         lines = [
             "[Zhihu answer]",
             f"Question: {title}",
             f"Author: {author}",
             f"Upvotes: {self._integer(payload.get('voteup_count'))}",
-            f"Comment count: {self._integer(payload.get('comment_count'))}",
+            f"Comment count: {reported_comments}",
             f"Created: {self._timestamp(payload.get('created_time'))}",
             f"Updated: {self._timestamp(payload.get('updated_time'))}",
             f"Source: {target.canonical_url}",
@@ -531,9 +589,14 @@ class ZhihuReader:
             "Answer:",
             content,
         ]
-        return self._compose_with_comments(lines, comments)
+        return _RenderedDocument(
+            self._compose_with_comments(lines, comments),
+            comments_complete=comments.error is None,
+        )
 
-    async def _read_article(self, target: ZhihuTarget, comment_limit: int) -> str:
+    async def _read_article(
+        self, target: ZhihuTarget, comment_limit: int
+    ) -> _RenderedDocument:
         payload = await self._fetch_json(
             f"/api/v4/articles/{target.resource_id}",
             params={
@@ -547,15 +610,19 @@ class ZhihuReader:
         if not content:
             raise ZhihuRequestError("The Zhihu article did not contain readable text.")
 
+        reported_comments = self._integer(payload.get("comment_count"))
         comments = await self._safe_comments(
-            "article", target.resource_id, comment_limit
+            "article",
+            target.resource_id,
+            comment_limit,
+            expected_count=reported_comments,
         )
         lines = [
             "[Zhihu article]",
             f"Title: {html_to_text(payload.get('title')) or 'Untitled article'}",
             f"Author: {self._author_name(payload.get('author'))}",
             f"Upvotes: {self._integer(payload.get('voteup_count'))}",
-            f"Comment count: {self._integer(payload.get('comment_count'))}",
+            f"Comment count: {reported_comments}",
             "Created: "
             f"{self._timestamp(payload.get('created') or payload.get('created_time'))}",
             "Updated: "
@@ -565,9 +632,14 @@ class ZhihuReader:
             "Article:",
             content,
         ]
-        return self._compose_with_comments(lines, comments)
+        return _RenderedDocument(
+            self._compose_with_comments(lines, comments),
+            comments_complete=comments.error is None,
+        )
 
-    async def _read_question(self, target: ZhihuTarget, comment_limit: int) -> str:
+    async def _read_question(
+        self, target: ZhihuTarget, comment_limit: int
+    ) -> _RenderedDocument:
         payload = await self._fetch_json(
             f"/api/v4/questions/{target.resource_id}",
             params={
@@ -599,50 +671,160 @@ class ZhihuReader:
         answers = answers[: self._max_question_answers]
 
         description = html_to_text(payload.get("detail") or payload.get("excerpt"))
-        comments = await self._safe_comments(
-            "question", target.resource_id, comment_limit
-        )
+        reported_question_comments = self._integer(payload.get("comment_count"))
         lines = [
             "[Zhihu question]",
             f"Question: {html_to_text(payload.get('title')) or 'Untitled question'}",
             f"Answers: {self._integer(payload.get('answer_count'))}",
             f"Followers: {self._integer(payload.get('follower_count'))}",
-            f"Comment count: {self._integer(payload.get('comment_count'))}",
+            f"Comment count: {reported_question_comments}",
             f"Source: {target.canonical_url}",
         ]
         if description:
             lines.extend(["", "Description:", description])
+
+        comment_targets: list[tuple[str, str, int, int]] = []
+        comment_lines: list[str] = []
+        comments_complete = True
 
         lines.extend(["", f"Top answers captured: {len(answers)}"])
         for index, answer in enumerate(answers, start=1):
             body = html_to_text(answer.get("content") or answer.get("excerpt"))
             if not body:
                 body = "[No readable answer text]"
+            answer_comment_count = self._integer(answer.get("comment_count"))
             lines.extend(
                 [
                     "",
                     f"Answer {index}",
                     f"Author: {self._author_name(answer.get('author'))}",
                     f"Upvotes: {self._integer(answer.get('voteup_count'))}",
-                    f"Comments: {self._integer(answer.get('comment_count'))}",
+                    f"Comments: {answer_comment_count}",
                     body,
                 ]
             )
-        return self._compose_with_comments(lines, comments)
+            answer_id = self._positive_id(answer.get("id"))
+            if comment_limit > 0:
+                if answer_id is None:
+                    comments_complete = False
+                    comment_lines.extend(
+                        [
+                            "",
+                            f"Answer {index} comments unavailable: "
+                            "Zhihu omitted the answer ID.",
+                        ]
+                    )
+                else:
+                    comment_targets.append(
+                        (
+                            f"Answer {index}",
+                            "answer",
+                            answer_id,
+                            answer_comment_count,
+                        )
+                    )
+
+        if comment_limit > 0:
+            comment_targets.append(
+                (
+                    "Question",
+                    "question",
+                    target.resource_id,
+                    reported_question_comments,
+                )
+            )
+
+        remaining = comment_limit
+        for target_index, (label, kind, resource_id, expected_count) in enumerate(
+            comment_targets
+        ):
+            if remaining <= 0:
+                break
+            targets_left = len(comment_targets) - target_index
+            quota = max(1, remaining // targets_left)
+            result = await self._safe_comments(
+                kind,
+                resource_id,
+                quota,
+                expected_count=expected_count,
+            )
+            if result.comments:
+                self._append_comments(
+                    comment_lines,
+                    result.comments,
+                    heading=f"{label} comments captured",
+                )
+            if result.error:
+                comments_complete = False
+                availability = (
+                    "partially unavailable" if result.comments else "unavailable"
+                )
+                comment_lines.extend(
+                    ["", f"{label} comments {availability}: {result.error}"]
+                )
+            remaining = max(0, remaining - result.captured_count)
+
+        return _RenderedDocument(
+            self._compose_with_comment_lines(lines, comment_lines),
+            comments_complete=comments_complete,
+        )
 
     async def _safe_comments(
-        self, kind: str, resource_id: int, comment_limit: int
-    ) -> list[_Comment]:
+        self,
+        kind: str,
+        resource_id: int,
+        comment_limit: int,
+        *,
+        expected_count: int = 0,
+    ) -> _CommentsResult:
         if comment_limit == 0:
-            return []
+            return _CommentsResult()
         try:
-            return await self._read_comments(kind, resource_id, comment_limit)
-        except ZhihuReaderError:
-            return []
+            result = await self._read_comments(
+                kind,
+                resource_id,
+                comment_limit,
+                expected_count=expected_count,
+            )
+        except ZhihuReaderError as exc:
+            message = str(exc)
+            _LOGGER.warning(
+                "Zhihu %s comments unavailable for %s: %s",
+                kind,
+                resource_id,
+                message,
+            )
+            return _CommentsResult(error=message)
+
+        if result.error:
+            _LOGGER.warning(
+                "Zhihu %s comments were only partially available for %s: %s",
+                kind,
+                resource_id,
+                result.error,
+            )
+        if expected_count > 0 and not result.comments and not result.error:
+            message = (
+                f"Zhihu reports {expected_count} comments but returned no readable "
+                "comments."
+            )
+            _LOGGER.warning(
+                "Zhihu %s comments unavailable for %s: %s",
+                kind,
+                resource_id,
+                message,
+            )
+            return _CommentsResult(error=message)
+        return result
 
     async def _read_comments(
-        self, kind: str, resource_id: int, comment_limit: int
-    ) -> list[_Comment]:
+        self,
+        kind: str,
+        resource_id: int,
+        comment_limit: int,
+        *,
+        expected_count: int = 0,
+    ) -> _CommentsResult:
         plural = {
             "answer": "answers",
             "article": "articles",
@@ -653,21 +835,52 @@ class ZhihuReader:
 
         endpoint = f"/api/v4/comment_v5/{plural}/{resource_id}/root_comment"
         comments: list[_Comment] = []
+        errors: list[str] = []
+        seen_comment_ids: set[int] = set()
         captured_count = 0
-        offset = 0
-        for _ in range(self._max_comment_pages):
+        offset = "0"
+        seen_offsets = {offset}
+        order_by = "score"
+        for page_index in range(self._max_comment_pages):
             page_limit = min(20, max(1, comment_limit - captured_count))
-            payload = await self._fetch_json(
-                endpoint,
-                params={
-                    "limit": page_limit,
-                    "offset": offset,
-                    "order_by": "score",
-                },
-            )
+            try:
+                payload = await self._fetch_comment_json(
+                    endpoint,
+                    params={
+                        "limit": page_limit,
+                        "offset": offset,
+                        "order_by": order_by,
+                    },
+                )
+            except ZhihuReaderError as exc:
+                if not comments:
+                    raise
+                errors.append(str(exc))
+                break
             data = payload.get("data")
             if not isinstance(data, list):
-                raise ZhihuRequestError("Zhihu returned an invalid comment list.")
+                errors.append("Zhihu returned an invalid comment list.")
+                break
+            if page_index == 0 and not data:
+                order_by = "ts"
+                try:
+                    payload = await self._fetch_comment_json(
+                        endpoint,
+                        params={
+                            "limit": page_limit,
+                            "offset": offset,
+                            "order_by": order_by,
+                        },
+                    )
+                except ZhihuReaderError as exc:
+                    if not comments:
+                        raise
+                    errors.append(str(exc))
+                    break
+                data = payload.get("data")
+                if not isinstance(data, list):
+                    errors.append("Zhihu returned an invalid comment list.")
+                    break
             if not data:
                 break
 
@@ -676,9 +889,17 @@ class ZhihuReader:
                     break
                 if not isinstance(raw_comment, Mapping):
                     continue
+                root_comment_id = self._positive_id(raw_comment.get("id"))
+                if (
+                    root_comment_id is not None
+                    and root_comment_id in seen_comment_ids
+                ):
+                    continue
                 text = html_to_text(raw_comment.get("content"))
                 if not text:
                     continue
+                if root_comment_id is not None:
+                    seen_comment_ids.add(root_comment_id)
 
                 captured_count += 1
                 children: list[_Comment] = []
@@ -706,7 +927,6 @@ class ZhihuReader:
                 declared_children = self._integer(
                     raw_comment.get("child_comment_count")
                 )
-                root_comment_id = self._positive_id(raw_comment.get("id"))
                 remaining_children = min(
                     self._max_child_comments - len(children),
                     comment_limit - captured_count,
@@ -716,16 +936,19 @@ class ZhihuReader:
                     and declared_children > len(children)
                     and remaining_children > 0
                 ):
-                    try:
-                        fetched_children = await self._read_child_comments(
-                            root_comment_id,
-                            remaining_children,
-                            seen_child_ids,
-                        )
-                    except ZhihuReaderError:
-                        fetched_children = []
-                    children.extend(fetched_children)
-                    captured_count += len(fetched_children)
+                    initial_child_offset = self._normalize_comment_offset(
+                        raw_comment.get("child_comment_next_offset")
+                    ) or "0"
+                    child_result = await self._read_child_comments(
+                        root_comment_id,
+                        remaining_children,
+                        seen_child_ids,
+                        initial_offset=initial_child_offset,
+                    )
+                    children.extend(child_result.comments)
+                    captured_count += len(child_result.comments)
+                    if child_result.error:
+                        errors.append(child_result.error)
 
                 comments.append(
                     _Comment(
@@ -744,34 +967,58 @@ class ZhihuReader:
             paging = payload.get("paging")
             if isinstance(paging, Mapping) and paging.get("is_end") is True:
                 break
-            offset += len(data)
             if captured_count >= comment_limit:
                 break
-        return comments
+            next_offset = self._next_comment_offset(
+                paging,
+                endpoint=endpoint,
+            )
+            if next_offset is None:
+                errors.append(
+                    "Zhihu comment pagination did not provide a safe next cursor."
+                )
+                break
+            if next_offset in seen_offsets:
+                errors.append("Zhihu comment pagination repeated a cursor.")
+                break
+            seen_offsets.add(next_offset)
+            offset = next_offset
+        error = "; ".join(dict.fromkeys(errors)) if errors else None
+        return _CommentsResult(tuple(comments), error=error)
 
     async def _read_child_comments(
         self,
         root_comment_id: int,
         child_limit: int,
         seen_ids: set[int],
-    ) -> list[_Comment]:
+        *,
+        initial_offset: str = "0",
+    ) -> _CommentsResult:
         """Fetch replies omitted from a comment_v5 root-comment response."""
         endpoint = (
             f"/api/v4/comment_v5/comment/{root_comment_id}/child_comment"
         )
         children: list[_Comment] = []
-        offset = 0
+        errors: list[str] = []
+        offset = initial_offset
+        seen_offsets = {offset}
         for _ in range(self._max_comment_pages):
-            page_limit = min(20, max(1, child_limit - len(children)))
-            payload = await self._fetch_json(
-                endpoint,
-                params={"limit": page_limit, "offset": offset},
+            page_limit = min(
+                20,
+                max(1, child_limit - len(children) + len(seen_ids)),
             )
+            try:
+                payload = await self._fetch_comment_json(
+                    endpoint,
+                    params={"limit": page_limit, "offset": offset},
+                )
+            except ZhihuReaderError as exc:
+                errors.append(str(exc))
+                break
             data = payload.get("data")
             if not isinstance(data, list):
-                raise ZhihuRequestError(
-                    "Zhihu returned an invalid child comment list."
-                )
+                errors.append("Zhihu returned an invalid child comment list.")
+                break
             if not data:
                 break
 
@@ -795,10 +1042,73 @@ class ZhihuReader:
             paging = payload.get("paging")
             if isinstance(paging, Mapping) and paging.get("is_end") is True:
                 break
-            offset += len(data)
             if len(children) >= child_limit:
                 break
-        return children
+            next_offset = self._next_comment_offset(
+                paging,
+                endpoint=endpoint,
+            )
+            if next_offset is None:
+                errors.append(
+                    "Zhihu child-comment pagination did not provide a safe next cursor."
+                )
+                break
+            if next_offset in seen_offsets:
+                errors.append("Zhihu child-comment pagination repeated a cursor.")
+                break
+            seen_offsets.add(next_offset)
+            offset = next_offset
+        error = "; ".join(dict.fromkeys(errors)) if errors else None
+        return _CommentsResult(tuple(children), error=error)
+
+    @staticmethod
+    def _next_comment_offset(
+        paging: object,
+        *,
+        endpoint: str,
+    ) -> str | None:
+        """Extract the opaque comment cursor without following response URLs."""
+        if not isinstance(paging, Mapping) or paging.get("is_end") is True:
+            return None
+
+        next_url = paging.get("next")
+        if isinstance(next_url, str) and next_url:
+            try:
+                parsed = urlsplit(next_url)
+                host = (parsed.hostname or "").lower().rstrip(".")
+                is_relative = not parsed.scheme and not parsed.netloc
+                if not is_relative and (
+                    parsed.scheme.lower() not in {"http", "https"}
+                    or host not in _SUPPORTED_HOSTS
+                    or parsed.username is not None
+                    or parsed.password is not None
+                    or parsed.port is not None
+                ):
+                    return None
+                if parsed.path != endpoint:
+                    return None
+                offsets = parse_qs(
+                    parsed.query,
+                    keep_blank_values=True,
+                ).get("offset")
+                if not offsets:
+                    return None
+                return ZhihuReader._normalize_comment_offset(offsets[0])
+            except ValueError:
+                return None
+
+        return None
+
+    @staticmethod
+    def _normalize_comment_offset(value: object) -> str | None:
+        offset = str(value).strip() if value is not None else ""
+        if (
+            not offset
+            or len(offset) > 512
+            or any(ord(char) < 32 or ord(char) == 127 for char in offset)
+        ):
+            return None
+        return offset
 
     def _comment_from_mapping(self, value: Mapping[str, object], text: str) -> _Comment:
         return _Comment(
@@ -863,11 +1173,16 @@ class ZhihuReader:
             return "Unknown"
 
     @staticmethod
-    def _append_comments(lines: list[str], comments: list[_Comment]) -> None:
+    def _append_comments(
+        lines: list[str],
+        comments: Sequence[_Comment],
+        *,
+        heading: str = "Comments captured",
+    ) -> None:
         if not comments:
             return
         captured = sum(1 + len(comment.children) for comment in comments)
-        lines.extend(["", f"Comments captured: {captured}"])
+        lines.extend(["", f"{heading}: {captured}"])
         for index, comment in enumerate(comments, start=1):
             text = comment.text.replace("\n", " ")
             lines.append(
@@ -884,15 +1199,30 @@ class ZhihuReader:
     def _compose_with_comments(
         self,
         primary_lines: list[str],
-        comments: list[_Comment],
+        comments: _CommentsResult,
     ) -> str:
         """Keep representative comments visible when the primary text is long."""
+        comment_lines: list[str] = []
+        self._append_comments(comment_lines, comments.comments)
+        if comments.error:
+            availability = (
+                "partially unavailable" if comments.comments else "unavailable"
+            )
+            comment_lines.extend(
+                ["", f"Comments {availability}: {comments.error}"]
+            )
+        return self._compose_with_comment_lines(primary_lines, comment_lines)
+
+    def _compose_with_comment_lines(
+        self,
+        primary_lines: list[str],
+        comment_lines: Sequence[str],
+    ) -> str:
+        """Reserve output space for rendered comments and their diagnostics."""
         primary = "\n".join(primary_lines).strip()
-        if not comments:
+        if not comment_lines:
             return primary
 
-        comment_lines: list[str] = []
-        self._append_comments(comment_lines, comments)
         full_comments = "\n".join(comment_lines).strip()
         separator = "\n\n"
         if (
