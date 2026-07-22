@@ -1,0 +1,57 @@
+{
+  "auto_inject": {
+    "description": "自动读取消息中的知乎链接",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，在正常对话请求中识别知乎链接，并将抓取结果作为本轮临时资料提供给大模型。"
+  },
+  "cookie": {
+    "description": "知乎 Cookie",
+    "type": "text",
+    "default": "",
+    "obvious_hint": true,
+    "hint": "可选。部分内容或评论需要登录态，通常填入浏览器请求中的完整 Cookie。Cookie 属于敏感凭据，请勿分享。"
+  },
+  "include_comments": {
+    "description": "读取评论",
+    "type": "bool",
+    "default": true,
+    "hint": "同时抓取当前文章、问题或回答下的评论。"
+  },
+  "max_comments": {
+    "description": "单个链接最多读取的评论数",
+    "type": "int",
+    "default": 10,
+    "hint": "运行时限制为 0-50；设为 0 时不读取评论。"
+  },
+  "max_content_chars": {
+    "description": "单个链接的正文字符上限",
+    "type": "int",
+    "default": 8000,
+    "hint": "正文与评论合计的字符预算，运行时限制为 500-50000。"
+  },
+  "max_inject_chars": {
+    "description": "单轮临时注入字符上限",
+    "type": "int",
+    "default": 12000,
+    "hint": "所有链接及安全边界合计的硬上限，运行时限制为 500-60000。"
+  },
+  "timeout_seconds": {
+    "description": "网络请求超时（秒）",
+    "type": "float",
+    "default": 20.0,
+    "hint": "单次网络请求的超时时间，运行时限制为 3-120 秒。"
+  },
+  "cache_ttl_seconds": {
+    "description": "缓存有效期（秒）",
+    "type": "int",
+    "default": 600,
+    "hint": "相同链接在此时间内复用抓取结果；设为 0 可关闭缓存，最大 86400 秒。"
+  },
+  "max_urls": {
+    "description": "单轮最多读取的知乎链接数",
+    "type": "int",
+    "default": 1,
+    "hint": "防止一条消息触发过多网络请求，运行时限制为 1-5。"
+  }
+}

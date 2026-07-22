@@ -1,0 +1,970 @@
+from __future__ import annotations
+
+import json
+import re
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from html.parser import HTMLParser
+from typing import Any, Callable, Literal, Mapping
+from urllib.parse import urlsplit
+
+import httpx
+
+
+_API_ORIGIN = "https://www.zhihu.com"
+_SUPPORTED_HOSTS = {"zhihu.com", "www.zhihu.com", "zhuanlan.zhihu.com"}
+_RESOURCE_ID = r"([1-9]\d{0,29})"
+_HARD_MAX_COMMENTS = 50
+_SAFE_API_ENDPOINTS = (
+    re.compile(r"/api/v4/(?:answers|articles|questions)/[1-9]\d{0,29}"),
+    re.compile(r"/api/v4/questions/[1-9]\d{0,29}/answers"),
+    re.compile(
+        r"/api/v4/comment_v5/(?:answers|articles|questions)/"
+        r"[1-9]\d{0,29}/root_comment"
+    ),
+    re.compile(
+        r"/api/v4/comment_v5/comment/[1-9]\d{0,29}/child_comment"
+    ),
+)
+
+
+class ZhihuReaderError(Exception):
+    """Base error suitable for showing to a bot user."""
+
+
+class InvalidZhihuUrlError(ZhihuReaderError, ValueError):
+    """Raised when a URL is not a supported Zhihu content URL."""
+
+
+class ZhihuRequestError(ZhihuReaderError):
+    """Raised when Zhihu cannot be queried safely or successfully."""
+
+
+class ZhihuDocument(str):
+    """Formatted Zhihu material with a bounded text rendering method."""
+
+    def to_text(self, max_chars: int | None = None) -> str:
+        """Return the formatted text, optionally truncated to a hard limit."""
+        text = str(self)
+        if max_chars is None or len(text) <= max_chars:
+            return text
+        if max_chars <= 0:
+            return ""
+        marker = "\n\n[Output truncated.]"
+        if max_chars <= len(marker):
+            return text[:max_chars]
+        return text[: max_chars - len(marker)].rstrip() + marker
+
+
+@dataclass(frozen=True, slots=True)
+class ZhihuTarget:
+    """A validated Zhihu resource extracted from an untrusted URL."""
+
+    kind: Literal["answer", "article", "question"]
+    resource_id: int
+    question_id: int | None = None
+
+    @property
+    def canonical_url(self) -> str:
+        """Return a canonical public URL built only from validated numeric IDs."""
+        if self.kind == "answer":
+            if self.question_id is not None:
+                return (
+                    f"https://www.zhihu.com/question/{self.question_id}"
+                    f"/answer/{self.resource_id}"
+                )
+            return f"https://www.zhihu.com/answer/{self.resource_id}"
+        if self.kind == "article":
+            return f"https://zhuanlan.zhihu.com/p/{self.resource_id}"
+        return f"https://www.zhihu.com/question/{self.resource_id}"
+
+
+@dataclass(frozen=True, slots=True)
+class _Comment:
+    author: str
+    text: str
+    votes: int
+    created_at: str
+    children: tuple[_Comment, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _CacheEntry:
+    expires_at: float
+    text: str
+
+
+class _HTMLTextExtractor(HTMLParser):
+    """Convert API-provided HTML into compact text without loading any assets."""
+
+    _BLOCK_TAGS = {
+        "article",
+        "blockquote",
+        "div",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "li",
+        "ol",
+        "p",
+        "pre",
+        "section",
+        "table",
+        "tr",
+        "ul",
+    }
+    _IGNORED_TAGS = {"script", "style", "template"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self._ignored_depth = 0
+
+    def handle_starttag(
+        self, tag: str, attrs: list[tuple[str, str | None]]
+    ) -> None:
+        tag = tag.lower()
+        if tag in self._IGNORED_TAGS:
+            self._ignored_depth += 1
+            return
+        if self._ignored_depth:
+            return
+        if tag == "br":
+            self.parts.append("\n")
+        elif tag == "li":
+            self.parts.append("\n- ")
+        elif tag in self._BLOCK_TAGS:
+            self.parts.append("\n")
+        elif tag == "img":
+            attributes = dict(attrs)
+            alt = str(attributes.get("alt") or "").strip()
+            self.parts.append(f"[Image: {alt}]" if alt else "[Image]")
+
+    def handle_startendtag(
+        self, tag: str, attrs: list[tuple[str, str | None]]
+    ) -> None:
+        self.handle_starttag(tag, attrs)
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag in self._IGNORED_TAGS:
+            if self._ignored_depth:
+                self._ignored_depth -= 1
+            return
+        if not self._ignored_depth and tag in self._BLOCK_TAGS:
+            self.parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if not self._ignored_depth:
+            self.parts.append(data)
+
+
+def html_to_text(value: object) -> str:
+    """Convert Zhihu HTML or plain text into normalized readable text."""
+    if value is None:
+        return ""
+    source = str(value)
+    parser = _HTMLTextExtractor()
+    try:
+        parser.feed(source)
+        parser.close()
+        source = "".join(parser.parts)
+    except Exception:
+        source = re.sub(r"<[^>]*>", " ", source)
+
+    normalized_lines: list[str] = []
+    previous_blank = True
+    for raw_line in source.replace("\r", "\n").split("\n"):
+        line = re.sub(r"[\t\f\v ]+", " ", raw_line).strip()
+        if line:
+            normalized_lines.append(line)
+            previous_blank = False
+        elif not previous_blank:
+            normalized_lines.append("")
+            previous_blank = True
+    return "\n".join(normalized_lines).strip()
+
+
+def parse_zhihu_url(url: str) -> ZhihuTarget:
+    """Parse a supported Zhihu URL without making a network request.
+
+    Accepted forms include question answers, questions, Zhuanlan articles, and
+    mobile Tardis article URLs. The original URL is never used as a request
+    destination.
+
+    Args:
+        url: The user-provided URL.
+
+    Returns:
+        A validated target containing numeric resource IDs.
+
+    Raises:
+        InvalidZhihuUrlError: If the URL is malformed or unsupported.
+    """
+    if not isinstance(url, str) or not url.strip():
+        raise InvalidZhihuUrlError(
+            "Please provide a Zhihu answer, article, or question URL."
+        )
+
+    try:
+        parsed = urlsplit(url.strip())
+        host = (parsed.hostname or "").lower().rstrip(".")
+        port = parsed.port
+    except ValueError as exc:
+        raise InvalidZhihuUrlError("The Zhihu URL is malformed.") from exc
+
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or host not in _SUPPORTED_HOSTS
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is not None
+    ):
+        raise InvalidZhihuUrlError(
+            "Only direct Zhihu answer, article, and question URLs are supported."
+        )
+
+    path = re.sub(r"/{2,}", "/", parsed.path)
+    if host == "zhuanlan.zhihu.com":
+        match = re.fullmatch(rf"/p/{_RESOURCE_ID}/?", path)
+        if match:
+            return ZhihuTarget("article", int(match.group(1)))
+        raise InvalidZhihuUrlError("This Zhuanlan URL does not identify an article.")
+
+    match = re.fullmatch(
+        rf"/question/{_RESOURCE_ID}/answer/{_RESOURCE_ID}/?", path
+    )
+    if match:
+        return ZhihuTarget(
+            "answer", int(match.group(2)), question_id=int(match.group(1))
+        )
+
+    match = re.fullmatch(rf"/answer/{_RESOURCE_ID}/?", path)
+    if match:
+        return ZhihuTarget("answer", int(match.group(1)))
+
+    match = re.fullmatch(rf"/question/{_RESOURCE_ID}/?", path)
+    if match:
+        return ZhihuTarget("question", int(match.group(1)))
+
+    match = re.fullmatch(
+        rf"/tardis/(?:[A-Za-z0-9_-]+/)*art/{_RESOURCE_ID}/?", path
+    )
+    if match:
+        return ZhihuTarget("article", int(match.group(1)))
+
+    raise InvalidZhihuUrlError("The URL does not identify a supported Zhihu resource.")
+
+
+def parse_url(url: str) -> ZhihuTarget | None:
+    """Return a parsed target, or ``None`` for compatibility with plugin callers."""
+    try:
+        return parse_zhihu_url(url)
+    except InvalidZhihuUrlError:
+        return None
+
+
+def extract_zhihu_urls(text: str) -> list[str]:
+    """Extract validated direct Zhihu content URLs from arbitrary message text."""
+    if not isinstance(text, str) or not text:
+        return []
+
+    urls: list[str] = []
+    trailing = ".,;:!?)]}>\"'\u3002\uff0c\uff1b\uff1a\uff01\uff1f\uff09\u3011\u300b"
+    for match in re.finditer(r"https?://[^\s<>\"']+", text, flags=re.IGNORECASE):
+        candidate = match.group(0).rstrip(trailing)
+        if parse_url(candidate) is not None:
+            urls.append(candidate)
+        if len(urls) >= 20:
+            break
+    return urls
+
+
+class ZhihuReader:
+    """Fetch and format Zhihu resources through fixed official API endpoints."""
+
+    def __init__(
+        self,
+        *,
+        client: httpx.AsyncClient | None = None,
+        cookie: str = "",
+        timeout_seconds: float = 15.0,
+        max_response_bytes: int = 2_000_000,
+        max_comments: int = 20,
+        max_child_comments: int = 3,
+        max_comment_pages: int = 2,
+        max_question_answers: int = 3,
+        max_output_chars: int = 30_000,
+        cache_ttl_seconds: float = 300.0,
+        max_cache_entries: int = 128,
+        clock: Callable[[], float] = time.monotonic,
+        timeout: float | None = None,
+        cache_ttl: float | None = None,
+    ) -> None:
+        if timeout is not None:
+            timeout_seconds = timeout
+        if cache_ttl is not None:
+            cache_ttl_seconds = cache_ttl
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive")
+        if max_response_bytes <= 0:
+            raise ValueError("max_response_bytes must be positive")
+        if max_comments < 0 or max_child_comments < 0:
+            raise ValueError("comment limits cannot be negative")
+        if max_comment_pages <= 0 or max_question_answers <= 0:
+            raise ValueError("page and answer limits must be positive")
+        if max_output_chars <= 0 or cache_ttl_seconds < 0:
+            raise ValueError("output and cache limits are invalid")
+        if max_cache_entries <= 0:
+            raise ValueError("max_cache_entries must be positive")
+        if "\r" in cookie or "\n" in cookie:
+            raise ValueError("cookie cannot contain line breaks")
+
+        self._timeout = httpx.Timeout(timeout_seconds)
+        self._max_response_bytes = max_response_bytes
+        self._max_comments = max_comments
+        self._max_child_comments = max_child_comments
+        self._max_comment_pages = max_comment_pages
+        self._max_question_answers = max_question_answers
+        self._max_output_chars = max_output_chars
+        self._cache_ttl_seconds = cache_ttl_seconds
+        self._max_cache_entries = max_cache_entries
+        self._clock = clock
+        self._cache: dict[str, _CacheEntry] = {}
+        self._headers = {
+            "Accept": "application/json, text/plain, */*",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
+            ),
+            "Referer": "https://www.zhihu.com/",
+        }
+        if cookie.strip():
+            self._headers["Cookie"] = cookie.strip()
+
+        self._owns_client = client is None
+        self._client = client or httpx.AsyncClient(
+            timeout=self._timeout,
+            follow_redirects=False,
+            limits=httpx.Limits(max_connections=5, max_keepalive_connections=2),
+        )
+
+    async def __aenter__(self) -> ZhihuReader:
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        await self.aclose()
+
+    async def aclose(self) -> None:
+        """Close the internally-created HTTP client."""
+        if self._owns_client:
+            await self._client.aclose()
+
+    async def close(self) -> None:
+        """Compatibility alias used by the AstrBot plugin lifecycle."""
+        await self.aclose()
+
+    def clear_cache(self) -> None:
+        """Clear all cached formatted results."""
+        self._cache.clear()
+
+    async def read(
+        self,
+        url: str,
+        *,
+        include_comments: bool = True,
+        max_comments: int | None = None,
+    ) -> ZhihuDocument:
+        """Read a supported Zhihu URL and return bounded LLM reference text."""
+        target = parse_zhihu_url(url)
+        comment_limit = self._max_comments if max_comments is None else max_comments
+        if comment_limit < 0:
+            raise ValueError("max_comments cannot be negative")
+        if not include_comments:
+            comment_limit = 0
+        comment_limit = min(comment_limit, _HARD_MAX_COMMENTS)
+        cache_key = f"{target.kind}:{target.resource_id}:comments:{comment_limit}"
+        now = self._clock()
+        cached = self._cache.get(cache_key)
+        if cached and cached.expires_at > now:
+            return ZhihuDocument(cached.text)
+        if cached:
+            self._cache.pop(cache_key, None)
+
+        if target.kind == "answer":
+            result = await self._read_answer(target, comment_limit)
+        elif target.kind == "article":
+            result = await self._read_article(target, comment_limit)
+        else:
+            result = await self._read_question(target, comment_limit)
+
+        result = self._truncate(result)
+        if self._cache_ttl_seconds > 0:
+            expired_keys = [
+                key for key, entry in self._cache.items() if entry.expires_at <= now
+            ]
+            for key in expired_keys:
+                self._cache.pop(key, None)
+            if len(self._cache) >= self._max_cache_entries:
+                oldest_key = min(
+                    self._cache, key=lambda key: self._cache[key].expires_at
+                )
+                self._cache.pop(oldest_key, None)
+            self._cache[cache_key] = _CacheEntry(
+                expires_at=now + self._cache_ttl_seconds,
+                text=result,
+            )
+        return ZhihuDocument(result)
+
+    async def _fetch_json(
+        self, endpoint: str, *, params: Mapping[str, object] | None = None
+    ) -> dict[str, Any]:
+        if not any(pattern.fullmatch(endpoint) for pattern in _SAFE_API_ENDPOINTS):
+            raise ZhihuRequestError("An unsafe Zhihu API endpoint was rejected.")
+        request_url = f"{_API_ORIGIN}{endpoint}"
+
+        try:
+            async with self._client.stream(
+                "GET",
+                request_url,
+                params=params,
+                headers=self._headers,
+                timeout=self._timeout,
+                follow_redirects=False,
+            ) as response:
+                if response.is_redirect:
+                    raise ZhihuRequestError(
+                        "Zhihu returned an unexpected redirect; it was not followed."
+                    )
+                if response.status_code in {401, 403}:
+                    raise ZhihuRequestError(
+                        "Zhihu denied access. Configure a valid Cookie and try again."
+                    )
+                if response.status_code == 404:
+                    raise ZhihuRequestError(
+                        "The requested Zhihu content was not found."
+                    )
+                if response.status_code == 429:
+                    raise ZhihuRequestError(
+                        "Zhihu is rate limiting requests. Please try again later."
+                    )
+                if response.status_code < 200 or response.status_code >= 300:
+                    raise ZhihuRequestError(
+                        f"Zhihu returned HTTP {response.status_code}. "
+                        "Please try again later."
+                    )
+
+                content_length = response.headers.get("Content-Length")
+                if content_length:
+                    try:
+                        if int(content_length) > self._max_response_bytes:
+                            raise ZhihuRequestError(
+                                "Zhihu returned more data than the configured "
+                                "safety limit."
+                            )
+                    except ValueError:
+                        pass
+
+                body = bytearray()
+                async for chunk in response.aiter_bytes():
+                    body.extend(chunk)
+                    if len(body) > self._max_response_bytes:
+                        raise ZhihuRequestError(
+                            "Zhihu returned more data than the configured safety limit."
+                        )
+        except ZhihuReaderError:
+            raise
+        except httpx.TimeoutException as exc:
+            raise ZhihuRequestError(
+                "Reading Zhihu timed out. Please try again later."
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise ZhihuRequestError(
+                "Could not connect to Zhihu. Please try again later."
+            ) from exc
+
+        try:
+            payload = json.loads(body.decode("utf-8-sig"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ZhihuRequestError(
+                "Zhihu returned data that could not be parsed."
+            ) from exc
+        if not isinstance(payload, dict):
+            raise ZhihuRequestError("Zhihu returned an unexpected JSON structure.")
+        return payload
+
+    async def _read_answer(self, target: ZhihuTarget, comment_limit: int) -> str:
+        payload = await self._fetch_json(
+            f"/api/v4/answers/{target.resource_id}",
+            params={
+                "include": (
+                    "content,excerpt,voteup_count,comment_count,created_time,"
+                    "updated_time,author.name,question.title,question.id"
+                )
+            },
+        )
+        content = html_to_text(payload.get("content") or payload.get("excerpt"))
+        if not content:
+            raise ZhihuRequestError("The Zhihu answer did not contain readable text.")
+
+        question = payload.get("question")
+        question_data = question if isinstance(question, Mapping) else {}
+        title = html_to_text(question_data.get("title")) or "Untitled question"
+        author = self._author_name(payload.get("author"))
+        comments = await self._safe_comments(
+            "answer", target.resource_id, comment_limit
+        )
+        lines = [
+            "[Zhihu answer]",
+            f"Question: {title}",
+            f"Author: {author}",
+            f"Upvotes: {self._integer(payload.get('voteup_count'))}",
+            f"Comment count: {self._integer(payload.get('comment_count'))}",
+            f"Created: {self._timestamp(payload.get('created_time'))}",
+            f"Updated: {self._timestamp(payload.get('updated_time'))}",
+            f"Source: {target.canonical_url}",
+            "",
+            "Answer:",
+            content,
+        ]
+        return self._compose_with_comments(lines, comments)
+
+    async def _read_article(self, target: ZhihuTarget, comment_limit: int) -> str:
+        payload = await self._fetch_json(
+            f"/api/v4/articles/{target.resource_id}",
+            params={
+                "include": (
+                    "content,excerpt,title,voteup_count,comment_count,created,"
+                    "updated,author.name"
+                )
+            },
+        )
+        content = html_to_text(payload.get("content") or payload.get("excerpt"))
+        if not content:
+            raise ZhihuRequestError("The Zhihu article did not contain readable text.")
+
+        comments = await self._safe_comments(
+            "article", target.resource_id, comment_limit
+        )
+        lines = [
+            "[Zhihu article]",
+            f"Title: {html_to_text(payload.get('title')) or 'Untitled article'}",
+            f"Author: {self._author_name(payload.get('author'))}",
+            f"Upvotes: {self._integer(payload.get('voteup_count'))}",
+            f"Comment count: {self._integer(payload.get('comment_count'))}",
+            "Created: "
+            f"{self._timestamp(payload.get('created') or payload.get('created_time'))}",
+            "Updated: "
+            f"{self._timestamp(payload.get('updated') or payload.get('updated_time'))}",
+            f"Source: {target.canonical_url}",
+            "",
+            "Article:",
+            content,
+        ]
+        return self._compose_with_comments(lines, comments)
+
+    async def _read_question(self, target: ZhihuTarget, comment_limit: int) -> str:
+        payload = await self._fetch_json(
+            f"/api/v4/questions/{target.resource_id}",
+            params={
+                "include": (
+                    "title,detail,excerpt,answer_count,comment_count,follower_count"
+                )
+            },
+        )
+        answers_payload = await self._fetch_json(
+            f"/api/v4/questions/{target.resource_id}/answers",
+            params={
+                "include": (
+                    "content,excerpt,voteup_count,comment_count,created_time,"
+                    "updated_time,author.name"
+                ),
+                "limit": min(20, max(10, self._max_question_answers * 3)),
+                "offset": 0,
+                "platform": "desktop",
+                "sort_by": "default",
+            },
+        )
+        raw_answers = answers_payload.get("data")
+        if not isinstance(raw_answers, list):
+            raise ZhihuRequestError("Zhihu returned an invalid answer list.")
+        answers = [answer for answer in raw_answers if isinstance(answer, Mapping)]
+        answers.sort(
+            key=lambda answer: self._integer(answer.get("voteup_count")), reverse=True
+        )
+        answers = answers[: self._max_question_answers]
+
+        description = html_to_text(payload.get("detail") or payload.get("excerpt"))
+        comments = await self._safe_comments(
+            "question", target.resource_id, comment_limit
+        )
+        lines = [
+            "[Zhihu question]",
+            f"Question: {html_to_text(payload.get('title')) or 'Untitled question'}",
+            f"Answers: {self._integer(payload.get('answer_count'))}",
+            f"Followers: {self._integer(payload.get('follower_count'))}",
+            f"Comment count: {self._integer(payload.get('comment_count'))}",
+            f"Source: {target.canonical_url}",
+        ]
+        if description:
+            lines.extend(["", "Description:", description])
+
+        lines.extend(["", f"Top answers captured: {len(answers)}"])
+        for index, answer in enumerate(answers, start=1):
+            body = html_to_text(answer.get("content") or answer.get("excerpt"))
+            if not body:
+                body = "[No readable answer text]"
+            lines.extend(
+                [
+                    "",
+                    f"Answer {index}",
+                    f"Author: {self._author_name(answer.get('author'))}",
+                    f"Upvotes: {self._integer(answer.get('voteup_count'))}",
+                    f"Comments: {self._integer(answer.get('comment_count'))}",
+                    body,
+                ]
+            )
+        return self._compose_with_comments(lines, comments)
+
+    async def _safe_comments(
+        self, kind: str, resource_id: int, comment_limit: int
+    ) -> list[_Comment]:
+        if comment_limit == 0:
+            return []
+        try:
+            return await self._read_comments(kind, resource_id, comment_limit)
+        except ZhihuReaderError:
+            return []
+
+    async def _read_comments(
+        self, kind: str, resource_id: int, comment_limit: int
+    ) -> list[_Comment]:
+        plural = {
+            "answer": "answers",
+            "article": "articles",
+            "question": "questions",
+        }.get(kind)
+        if plural is None:
+            raise ZhihuRequestError("Unsupported comment resource type.")
+
+        endpoint = f"/api/v4/comment_v5/{plural}/{resource_id}/root_comment"
+        comments: list[_Comment] = []
+        captured_count = 0
+        offset = 0
+        for _ in range(self._max_comment_pages):
+            page_limit = min(20, max(1, comment_limit - captured_count))
+            payload = await self._fetch_json(
+                endpoint,
+                params={
+                    "limit": page_limit,
+                    "offset": offset,
+                    "order_by": "score",
+                },
+            )
+            data = payload.get("data")
+            if not isinstance(data, list):
+                raise ZhihuRequestError("Zhihu returned an invalid comment list.")
+            if not data:
+                break
+
+            for raw_comment in data:
+                if captured_count >= comment_limit:
+                    break
+                if not isinstance(raw_comment, Mapping):
+                    continue
+                text = html_to_text(raw_comment.get("content"))
+                if not text:
+                    continue
+
+                captured_count += 1
+                children: list[_Comment] = []
+                seen_child_ids: set[int] = set()
+                raw_children: object = raw_comment.get("child_comments", [])
+                if isinstance(raw_children, Mapping):
+                    raw_children = raw_children.get("data", [])
+                if isinstance(raw_children, list):
+                    for raw_child in raw_children[: self._max_child_comments]:
+                        if captured_count >= comment_limit:
+                            break
+                        if not isinstance(raw_child, Mapping):
+                            continue
+                        child_text = html_to_text(raw_child.get("content"))
+                        if not child_text:
+                            continue
+                        children.append(
+                            self._comment_from_mapping(raw_child, child_text)
+                        )
+                        child_id = self._positive_id(raw_child.get("id"))
+                        if child_id is not None:
+                            seen_child_ids.add(child_id)
+                        captured_count += 1
+
+                declared_children = self._integer(
+                    raw_comment.get("child_comment_count")
+                )
+                root_comment_id = self._positive_id(raw_comment.get("id"))
+                remaining_children = min(
+                    self._max_child_comments - len(children),
+                    comment_limit - captured_count,
+                )
+                if (
+                    root_comment_id is not None
+                    and declared_children > len(children)
+                    and remaining_children > 0
+                ):
+                    try:
+                        fetched_children = await self._read_child_comments(
+                            root_comment_id,
+                            remaining_children,
+                            seen_child_ids,
+                        )
+                    except ZhihuReaderError:
+                        fetched_children = []
+                    children.extend(fetched_children)
+                    captured_count += len(fetched_children)
+
+                comments.append(
+                    _Comment(
+                        author=self._comment_author_name(raw_comment),
+                        text=text,
+                        votes=self._integer(
+                            raw_comment.get("vote_count")
+                            if raw_comment.get("vote_count") is not None
+                            else raw_comment.get("like_count")
+                        ),
+                        created_at=self._timestamp(raw_comment.get("created_time")),
+                        children=tuple(children),
+                    )
+                )
+
+            paging = payload.get("paging")
+            if isinstance(paging, Mapping) and paging.get("is_end") is True:
+                break
+            offset += len(data)
+            if captured_count >= comment_limit:
+                break
+        return comments
+
+    async def _read_child_comments(
+        self,
+        root_comment_id: int,
+        child_limit: int,
+        seen_ids: set[int],
+    ) -> list[_Comment]:
+        """Fetch replies omitted from a comment_v5 root-comment response."""
+        endpoint = (
+            f"/api/v4/comment_v5/comment/{root_comment_id}/child_comment"
+        )
+        children: list[_Comment] = []
+        offset = 0
+        for _ in range(self._max_comment_pages):
+            page_limit = min(20, max(1, child_limit - len(children)))
+            payload = await self._fetch_json(
+                endpoint,
+                params={"limit": page_limit, "offset": offset},
+            )
+            data = payload.get("data")
+            if not isinstance(data, list):
+                raise ZhihuRequestError(
+                    "Zhihu returned an invalid child comment list."
+                )
+            if not data:
+                break
+
+            for raw_child in data:
+                if len(children) >= child_limit:
+                    break
+                if not isinstance(raw_child, Mapping):
+                    continue
+                child_id = self._positive_id(raw_child.get("id"))
+                if child_id is not None and child_id in seen_ids:
+                    continue
+                child_text = html_to_text(raw_child.get("content"))
+                if not child_text:
+                    continue
+                children.append(
+                    self._comment_from_mapping(raw_child, child_text)
+                )
+                if child_id is not None:
+                    seen_ids.add(child_id)
+
+            paging = payload.get("paging")
+            if isinstance(paging, Mapping) and paging.get("is_end") is True:
+                break
+            offset += len(data)
+            if len(children) >= child_limit:
+                break
+        return children
+
+    def _comment_from_mapping(self, value: Mapping[str, object], text: str) -> _Comment:
+        return _Comment(
+            author=self._comment_author_name(value),
+            text=text,
+            votes=self._integer(
+                value.get("vote_count")
+                if value.get("vote_count") is not None
+                else value.get("like_count")
+            ),
+            created_at=self._timestamp(value.get("created_time")),
+        )
+
+    @classmethod
+    def _comment_author_name(cls, value: Mapping[str, object]) -> str:
+        """Read author data from both observed comment_v5 response shapes."""
+        author = value.get("author")
+        if author is not None:
+            name = cls._author_name(author)
+            if name != "Anonymous":
+                return name
+        return cls._author_name(value.get("member"))
+
+    @staticmethod
+    def _positive_id(value: object) -> int | None:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return parsed if 0 < parsed < 10**30 else None
+
+    @staticmethod
+    def _author_name(value: object) -> str:
+        if isinstance(value, Mapping):
+            member = value.get("member")
+            if isinstance(member, Mapping):
+                name = html_to_text(member.get("name"))
+                if name:
+                    return name
+            name = html_to_text(value.get("name"))
+            if name:
+                return name
+        return "Anonymous"
+
+    @staticmethod
+    def _integer(value: object) -> int:
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
+    @staticmethod
+    def _timestamp(value: object) -> str:
+        try:
+            timestamp = float(value)
+            if timestamp <= 0:
+                return "Unknown"
+            return datetime.fromtimestamp(timestamp, timezone.utc).strftime(
+                "%Y-%m-%d %H:%M UTC"
+            )
+        except (TypeError, ValueError, OverflowError, OSError):
+            return "Unknown"
+
+    @staticmethod
+    def _append_comments(lines: list[str], comments: list[_Comment]) -> None:
+        if not comments:
+            return
+        captured = sum(1 + len(comment.children) for comment in comments)
+        lines.extend(["", f"Comments captured: {captured}"])
+        for index, comment in enumerate(comments, start=1):
+            text = comment.text.replace("\n", " ")
+            lines.append(
+                f"{index}. {comment.author} | {comment.votes} likes | "
+                f"{comment.created_at}: {text}"
+            )
+            for child in comment.children:
+                child_text = child.text.replace("\n", " ")
+                lines.append(
+                    f"   Reply - {child.author} | {child.votes} likes | "
+                    f"{child.created_at}: {child_text}"
+                )
+
+    def _compose_with_comments(
+        self,
+        primary_lines: list[str],
+        comments: list[_Comment],
+    ) -> str:
+        """Keep representative comments visible when the primary text is long."""
+        primary = "\n".join(primary_lines).strip()
+        if not comments:
+            return primary
+
+        comment_lines: list[str] = []
+        self._append_comments(comment_lines, comments)
+        full_comments = "\n".join(comment_lines).strip()
+        separator = "\n\n"
+        if (
+            len(primary) + len(separator) + len(full_comments)
+            <= self._max_output_chars
+        ):
+            return primary + separator + full_comments
+
+        comment_budget = max(1, self._max_output_chars * 35 // 100)
+        rendered_comments = self._truncate_section(
+            full_comments,
+            comment_budget,
+            "\n[Comments truncated.]",
+        )
+        primary_budget = max(
+            0,
+            self._max_output_chars
+            - len(separator)
+            - len(rendered_comments),
+        )
+        rendered_primary = self._truncate_section(
+            primary,
+            primary_budget,
+            "\n[Content truncated.]",
+        )
+
+        unused = (
+            self._max_output_chars
+            - len(rendered_primary)
+            - len(separator)
+            - len(rendered_comments)
+        )
+        if unused > 0 and len(rendered_comments) < len(full_comments):
+            rendered_comments = self._truncate_section(
+                full_comments,
+                len(rendered_comments) + unused,
+                "\n[Comments truncated.]",
+            )
+
+        return separator.join(
+            part for part in (rendered_primary, rendered_comments) if part
+        )
+
+    @staticmethod
+    def _truncate_section(text: str, limit: int, marker: str) -> str:
+        if limit <= 0:
+            return ""
+        if len(text) <= limit:
+            return text
+        if limit <= len(marker):
+            return text[:limit]
+        return text[: limit - len(marker)].rstrip() + marker
+
+    def _truncate(self, text: str) -> str:
+        text = text.strip()
+        if len(text) <= self._max_output_chars:
+            return text
+        marker = "\n\n[Output truncated at the configured character limit.]"
+        if self._max_output_chars <= len(marker):
+            return marker[: self._max_output_chars]
+        return text[: self._max_output_chars - len(marker)].rstrip() + marker
+
+
+__all__ = [
+    "InvalidZhihuUrlError",
+    "ZhihuReader",
+    "ZhihuReaderError",
+    "ZhihuRequestError",
+    "ZhihuDocument",
+    "ZhihuTarget",
+    "extract_zhihu_urls",
+    "html_to_text",
+    "parse_url",
+    "parse_zhihu_url",
+]

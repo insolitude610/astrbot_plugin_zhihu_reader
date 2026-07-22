@@ -1,0 +1,39 @@
+# 知乎阅读器
+
+让 AstrBot 读取知乎文章、问题、回答和评论，并把内容安全地提供给当前大模型请求。
+
+仓库：<https://github.com/insolitude610/astrbot_plugin_zhihu_reader>
+
+## 功能
+
+- 在普通消息中识别知乎链接，自动抓取正文与评论。
+- 使用 `/知乎阅读 <url>` 抓取后由当前会话的大模型总结；`/知乎读取` 和 `/zhihu_read` 是别名。
+- 对单篇正文、单轮注入、评论数量和链接数量分别设限。
+- 支持可选知乎 Cookie、请求超时和内存缓存。
+
+自动读取和命令读取的资料都会通过 AstrBot 的临时内容标记加入本轮请求，不写入会话历史。用户的消息和大模型生成的总结仍由 AstrBot 正常保存，因此可以围绕总结继续追问。插件不注册返回原文的 LLM 工具，避免工具结果被持久化进会话。所有知乎内容都被明确标记为外部不可信资料，正文或评论中的提示词不会被当作系统指令。
+
+## 安装与调试
+
+插件目录应位于 AstrBot 实例的 `data/plugins/astrbot_plugin_zhihu_reader/`，至少包含 `main.py`、`reader.py`、`metadata.yaml`、`_conf_schema.json` 和 `requirements.txt`。安装依赖并在 WebUI 的插件管理页重载插件后即可使用。
+
+支持的链接由 `reader.py` 决定，预期包括：
+
+- `https://zhuanlan.zhihu.com/p/<文章ID>`
+- `https://www.zhihu.com/question/<问题ID>`
+- `https://www.zhihu.com/question/<问题ID>/answer/<回答ID>`
+
+## 配置
+
+配置在 AstrBot WebUI 的插件设置中管理：
+
+- `auto_inject`：是否自动处理普通消息中的知乎链接。
+- `cookie`：可选登录 Cookie。它是敏感凭据，不应写入日志或公开仓库。
+- `include_comments` / `max_comments`：评论开关与单链接数量上限。
+- `max_content_chars`：每个链接输出的正文与评论字符预算，默认 `8000`。
+- `max_inject_chars`：单轮发送给模型的全部知乎资料硬上限，默认 `12000`。
+- `timeout_seconds`：网络请求超时。
+- `cache_ttl_seconds`：相同链接的缓存有效期，`0` 表示关闭缓存。
+- `max_urls`：单轮自动读取的链接数量上限，默认 `1`。
+
+知乎接口可能要求登录、触发风控或随站点更新而变化。抓取失败不会中断普通 LLM 请求；可先用 `/知乎阅读 <url>` 检查当前链接和 Cookie 是否可用。
