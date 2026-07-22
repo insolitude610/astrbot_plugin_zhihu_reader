@@ -1,8 +1,8 @@
 name: astrbot_plugin_zhihu_reader
 display_name: 知乎阅读器
-desc: 让 AstrBot 安全读取知乎文章、问题、回答和评论，并将资料临时提供给大模型。
-short_desc: 读取知乎正文与评论，通过临时上下文生成可继续追问的总结。
-version: 0.1.1
+desc: 让 AstrBot 安全读取知乎文章、想法、问题、回答和评论，并将资料临时提供给大模型。
+short_desc: 读取知乎正文、想法与评论，通过临时上下文生成可继续追问的总结。
+version: 0.2.0
 author: insolitude610
 repo: https://github.com/insolitude610/astrbot_plugin_zhihu_reader
 astrbot_version: ">=4.24.0,<5"

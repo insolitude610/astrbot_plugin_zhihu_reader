@@ -358,14 +358,14 @@ class ZhihuReaderPlugin(Star):
 
         Args:
             event: Current AstrBot message event.
-            url: Complete Zhihu article, question, or answer URL.
+            url: Complete Zhihu article, thought, question, or answer URL.
         """
         event.set_extra(_SKIP_AUTO_INJECT_KEY, True)
         try:
             normalized, text = await self._read_url(url)
         except ValueError:
             yield event.plain_result(
-                "无法识别该链接，请提供知乎文章、问题或回答的完整链接。"
+                "无法识别该链接，请提供知乎文章、想法、问题或回答的完整链接。"
             )
             return
         except Exception as exc:

@@ -4,6 +4,18 @@
 
 ## [未发布]
 
+## [0.2.0] - 2026-07-22
+
+### 新增
+
+- 支持读取 `zhihu.com/pin/<ID>` 形式的知乎“想法”链接。
+- 解析想法中的文本、图片、视频、链接和转发来源，并读取想法评论。
+
+### 修复
+
+- 根评论首屏改用知乎要求的空游标，修复部分内容显示有评论却返回空列表的问题。
+- 读取评论响应自身的总数，避免把异常的空评论结果写入缓存。
+
 ## [0.1.1] - 2026-07-22
 
 ### 修复
@@ -30,6 +42,7 @@
 - 将知乎内容标记为外部不可信资料，降低其中提示词影响模型指令的风险。
 - 避免在日志和公开仓库中记录可选的知乎 Cookie。
 
-[未发布]: https://github.com/insolitude610/astrbot_plugin_zhihu_reader/compare/v0.1.1...HEAD
+[未发布]: https://github.com/insolitude610/astrbot_plugin_zhihu_reader/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/insolitude610/astrbot_plugin_zhihu_reader/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/insolitude610/astrbot_plugin_zhihu_reader/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/insolitude610/astrbot_plugin_zhihu_reader/releases/tag/v0.1.0

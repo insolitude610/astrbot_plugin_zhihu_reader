@@ -122,7 +122,7 @@ class ZhihuReaderPluginTests(unittest.IsolatedAsyncioTestCase):
         event = FakeEvent()
         request = ProviderRequest(
             prompt=(
-                "总结 https://www.zhihu.com/question/123/answer/456 "
+                "总结 https://www.zhihu.com/appview/pin/1090928962359820288?utm_psn=test "
                 "以及 https://zhuanlan.zhihu.com/p/789"
             )
         )
@@ -133,6 +133,14 @@ class ZhihuReaderPluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(plugin.max_inject_chars, 12_000)
         self.assertEqual(plugin.max_urls, 1)
         self.assertEqual(len(plugin.reader.calls), 1)
+        self.assertEqual(
+            plugin.reader.calls[0],
+            (
+                "https://www.zhihu.com/pin/1090928962359820288",
+                True,
+                10,
+            ),
+        )
         self.assertEqual(len(request.extra_user_content_parts), 1)
         part = request.extra_user_content_parts[0]
         self.assertTrue(getattr(part, "_no_save", False))

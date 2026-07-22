@@ -41,6 +41,34 @@ class ParseZhihuUrlTests(unittest.TestCase):
         question = parse_zhihu_url("http://zhihu.com/question/321")
         self.assertEqual((question.kind, question.resource_id), ("question", 321))
 
+        pin = parse_zhihu_url(
+            "https://www.zhihu.com/pin/1090928962359820288?utm_psn=test"
+        )
+        self.assertEqual(
+            (pin.kind, pin.resource_id, pin.canonical_url),
+            (
+                "pin",
+                1090928962359820288,
+                "https://www.zhihu.com/pin/1090928962359820288",
+            ),
+        )
+
+        appview_pin = parse_zhihu_url(
+            "https://www.zhihu.com/appview/pin/1196005326011543552"
+        )
+        self.assertEqual(
+            (appview_pin.kind, appview_pin.resource_id),
+            ("pin", 1196005326011543552),
+        )
+
+        mobile_pin = parse_zhihu_url(
+            "https://www.zhihu.com/mobile/pin/1449471996145315840"
+        )
+        self.assertEqual(
+            (mobile_pin.kind, mobile_pin.resource_id),
+            ("pin", 1449471996145315840),
+        )
+
     def test_rejects_host_confusion_userinfo_and_unknown_paths(self) -> None:
         invalid_urls = [
             "https://www.zhihu.com.evil.example/question/1",
@@ -48,6 +76,7 @@ class ParseZhihuUrlTests(unittest.TestCase):
             "https://attacker@www.zhihu.com/question/1",
             "https://www.zhihu.com:443/question/1",
             "https://www.zhihu.com/people/someone",
+            "https://www.zhihu.com/pins/1090928962359820288",
             "javascript:https://www.zhihu.com/question/1",
         ]
         for url in invalid_urls:
@@ -68,13 +97,15 @@ class ParseZhihuUrlTests(unittest.TestCase):
         urls = extract_zhihu_urls(
             "Read https://www.zhihu.com/question/1/answer/2, "
             "ignore https://www.zhihu.com.evil.test/question/3 and "
-            "also https://zhuanlan.zhihu.com/p/4."
+            "also https://zhuanlan.zhihu.com/p/4 and "
+            "https://www.zhihu.com/pin/5."
         )
         self.assertEqual(
             urls,
             [
                 "https://www.zhihu.com/question/1/answer/2",
                 "https://zhuanlan.zhihu.com/p/4",
+                "https://www.zhihu.com/pin/5",
             ],
         )
 
@@ -110,7 +141,7 @@ class ZhihuReaderTests(unittest.IsolatedAsyncioTestCase):
                 offset = request.url.params["offset"]
                 root_offsets.append(offset)
                 self.assertEqual(request.url.params["order_by"], "score")
-                if offset == "0":
+                if offset == "":
                     return json_response(
                         {
                             "data": [
@@ -225,7 +256,7 @@ class ZhihuReaderTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Second reply", result)
         self.assertIn("Third reply", result)
         self.assertIn("Another comment", result)
-        self.assertEqual(root_offsets, ["0", "root_cursor"])
+        self.assertEqual(root_offsets, ["", "root_cursor"])
         self.assertEqual(child_offsets, ["embedded_cursor", "child_cursor"])
 
     async def test_comment_api_error_does_not_drop_answer_body(self) -> None:
@@ -284,6 +315,7 @@ class ZhihuReaderTests(unittest.IsolatedAsyncioTestCase):
                     }
                 )
             if request.url.path.endswith("/child_comment"):
+                self.assertEqual(request.url.params["offset"], "")
                 return json_response({}, status_code=403)
             return json_response({}, status_code=404)
 
@@ -412,7 +444,7 @@ class ZhihuReaderTests(unittest.IsolatedAsyncioTestCase):
                     return json_response(
                         {"data": [], "paging": {"is_end": True}}
                     )
-                if offset == "0":
+                if offset == "":
                     return json_response(
                         {
                             "data": [
@@ -454,11 +486,56 @@ class ZhihuReaderTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             requests,
-            [("score", "0"), ("ts", "0"), ("ts", "latest_cursor")],
+            [("score", ""), ("ts", ""), ("ts", "latest_cursor")],
         )
         self.assertIn("Latest comment", result)
         self.assertIn("Second latest comment", result)
         self.assertNotIn("Comments unavailable:", result)
+
+    async def test_comment_response_total_prevents_false_empty_cache(self) -> None:
+        answer_calls = 0
+        comment_requests: list[tuple[str, str]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal answer_calls
+            if request.url.path == "/api/v4/answers/456":
+                answer_calls += 1
+                return json_response(
+                    {
+                        "question": {"title": "Readable answer"},
+                        "content": "<p>Body</p>",
+                    }
+                )
+            if request.url.path.endswith("/root_comment"):
+                comment_requests.append(
+                    (
+                        request.url.params["order_by"],
+                        request.url.params["offset"],
+                    )
+                )
+                return json_response(
+                    {
+                        "counts": {"total_counts": 3},
+                        "data": [],
+                        "paging": {"is_end": False, "totals": 3},
+                    }
+                )
+            return json_response({}, status_code=404)
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
+            reader = ZhihuReader(client=client, max_comments=10)
+            first = await reader.read("https://www.zhihu.com/answer/456")
+            second = await reader.read("https://www.zhihu.com/answer/456")
+
+        self.assertEqual(first, second)
+        self.assertEqual(answer_calls, 2)
+        self.assertEqual(
+            comment_requests,
+            [("score", ""), ("ts", ""), ("score", ""), ("ts", "")],
+        )
+        self.assertIn("Zhihu reports 3 comments", first)
 
     async def test_long_answer_preserves_comment_budget(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
@@ -662,6 +739,142 @@ class ZhihuReaderTests(unittest.IsolatedAsyncioTestCase):
             "Answer 1 comments unavailable: Zhihu omitted the answer ID.",
             first,
         )
+
+    async def test_reads_structured_pin_content_and_comments(self) -> None:
+        requested_paths: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requested_paths.append(request.url.path)
+            if request.url.path == "/api/v4/pins/1090928962359820288":
+                return json_response(
+                    {
+                        "author": {"name": "Pin author"},
+                        "content": [
+                            {
+                                "type": "text",
+                                "content": "<p>A readable <strong>thought</strong>.</p>",
+                            },
+                            {
+                                "type": "image",
+                                "width": 640,
+                                "height": 480,
+                                "url": "https://pic.example/image.jpg",
+                            },
+                            {
+                                "type": "video",
+                                "duration": 12,
+                                "video_id": "1090928925277990912",
+                            },
+                            {
+                                "type": "link_card",
+                                "data_draft_title": "Reference",
+                                "url": "https://example.com/reference",
+                            },
+                        ],
+                        "source_pin_id": "1016771952047792128",
+                        "like_count": 4,
+                        "reaction_count": 12,
+                        "repin_count": 2,
+                        "comment_count": 1,
+                        "created": 1_700_000_000,
+                        "updated": 1_700_000_100,
+                    }
+                )
+            if request.url.path == (
+                "/api/v4/comment_v5/pins/1090928962359820288/root_comment"
+            ):
+                self.assertEqual(request.url.params["offset"], "")
+                return json_response(
+                    {
+                        "data": [
+                            {
+                                "id": 900,
+                                "member": {"name": "Pin commenter"},
+                                "content": "<p>Thought comment</p>",
+                                "like_count": 3,
+                            }
+                        ],
+                        "paging": {"is_end": True},
+                    }
+                )
+            return json_response({}, status_code=404)
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
+            reader = ZhihuReader(client=client, max_comments=2)
+            result = await reader.read(
+                "https://www.zhihu.com/pin/1090928962359820288"
+            )
+
+        self.assertEqual(
+            requested_paths,
+            [
+                "/api/v4/pins/1090928962359820288",
+                "/api/v4/comment_v5/pins/1090928962359820288/root_comment",
+            ],
+        )
+        self.assertIn("[Zhihu thought]", result)
+        self.assertIn("Author: Pin author", result)
+        self.assertIn("A readable thought.", result)
+        self.assertIn("[Image: 640x480]", result)
+        self.assertIn("[Video: 12 seconds]", result)
+        self.assertIn(
+            "[Link card: Reference - https://example.com/reference]",
+            result,
+        )
+        self.assertIn(
+            "Repin source: https://www.zhihu.com/pin/1016771952047792128",
+            result,
+        )
+        self.assertIn("Comments captured: 1", result)
+        self.assertIn("Thought comment", result)
+
+    async def test_pin_uses_content_html_fallback(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/api/v4/pins/1196005326011543552":
+                return json_response(
+                    {
+                        "author": {"name": "Photo author"},
+                        "content": [],
+                        "content_html": "<div>Photo thought</div><img alt='cat'>",
+                    }
+                )
+            return json_response({}, status_code=404)
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
+            reader = ZhihuReader(client=client, max_comments=0)
+            result = await reader.read(
+                "https://www.zhihu.com/pin/1196005326011543552"
+            )
+
+        self.assertIn("Photo thought", result)
+        self.assertIn("[Image: cat]", result)
+
+    async def test_deleted_pin_reports_its_reason(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/api/v4/pins/1090928962359820288":
+                return json_response(
+                    {
+                        "is_deleted": True,
+                        "deleted_reason": "<p>This thought was removed.</p>",
+                    }
+                )
+            return json_response({}, status_code=404)
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
+            reader = ZhihuReader(client=client, max_comments=0)
+            with self.assertRaisesRegex(
+                ZhihuRequestError,
+                "This thought was removed",
+            ):
+                await reader.read(
+                    "https://www.zhihu.com/pin/1090928962359820288"
+                )
 
     async def test_article_uses_excerpt_when_content_is_empty(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:

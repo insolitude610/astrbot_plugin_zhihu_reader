@@ -20,10 +20,12 @@ _SUPPORTED_HOSTS = {"zhihu.com", "www.zhihu.com", "zhuanlan.zhihu.com"}
 _RESOURCE_ID = r"([1-9]\d{0,29})"
 _HARD_MAX_COMMENTS = 50
 _SAFE_API_ENDPOINTS = (
-    re.compile(r"/api/v4/(?:answers|articles|questions)/[1-9]\d{0,29}"),
+    re.compile(
+        r"/api/v4/(?:answers|articles|pins|questions)/[1-9]\d{0,29}"
+    ),
     re.compile(r"/api/v4/questions/[1-9]\d{0,29}/answers"),
     re.compile(
-        r"/api/v4/comment_v5/(?:answers|articles|questions)/"
+        r"/api/v4/comment_v5/(?:answers|articles|pins|questions)/"
         r"[1-9]\d{0,29}/root_comment"
     ),
     re.compile(
@@ -68,7 +70,7 @@ class ZhihuDocument(str):
 class ZhihuTarget:
     """A validated Zhihu resource extracted from an untrusted URL."""
 
-    kind: Literal["answer", "article", "question"]
+    kind: Literal["answer", "article", "pin", "question"]
     resource_id: int
     question_id: int | None = None
 
@@ -84,6 +86,8 @@ class ZhihuTarget:
             return f"https://www.zhihu.com/answer/{self.resource_id}"
         if self.kind == "article":
             return f"https://zhuanlan.zhihu.com/p/{self.resource_id}"
+        if self.kind == "pin":
+            return f"https://www.zhihu.com/pin/{self.resource_id}"
         return f"https://www.zhihu.com/question/{self.resource_id}"
 
 
@@ -215,9 +219,9 @@ def html_to_text(value: object) -> str:
 def parse_zhihu_url(url: str) -> ZhihuTarget:
     """Parse a supported Zhihu URL without making a network request.
 
-    Accepted forms include question answers, questions, Zhuanlan articles, and
-    mobile Tardis article URLs. The original URL is never used as a request
-    destination.
+    Accepted forms include question answers, questions, Zhuanlan articles,
+    Zhihu thoughts, and mobile Tardis article URLs. The original URL is never
+    used as a request destination.
 
     Args:
         url: The user-provided URL.
@@ -230,7 +234,7 @@ def parse_zhihu_url(url: str) -> ZhihuTarget:
     """
     if not isinstance(url, str) or not url.strip():
         raise InvalidZhihuUrlError(
-            "Please provide a Zhihu answer, article, or question URL."
+            "Please provide a Zhihu answer, article, thought, or question URL."
         )
 
     try:
@@ -248,7 +252,8 @@ def parse_zhihu_url(url: str) -> ZhihuTarget:
         or port is not None
     ):
         raise InvalidZhihuUrlError(
-            "Only direct Zhihu answer, article, and question URLs are supported."
+            "Only direct Zhihu answer, article, thought, and question URLs are "
+            "supported."
         )
 
     path = re.sub(r"/{2,}", "/", parsed.path)
@@ -273,6 +278,10 @@ def parse_zhihu_url(url: str) -> ZhihuTarget:
     match = re.fullmatch(rf"/question/{_RESOURCE_ID}/?", path)
     if match:
         return ZhihuTarget("question", int(match.group(1)))
+
+    match = re.fullmatch(rf"/(?:appview/|mobile/)?pin/{_RESOURCE_ID}/?", path)
+    if match:
+        return ZhihuTarget("pin", int(match.group(1)))
 
     match = re.fullmatch(
         rf"/tardis/(?:[A-Za-z0-9_-]+/)*art/{_RESOURCE_ID}/?", path
@@ -422,6 +431,8 @@ class ZhihuReader:
             rendered = await self._read_answer(target, comment_limit)
         elif target.kind == "article":
             rendered = await self._read_article(target, comment_limit)
+        elif target.kind == "pin":
+            rendered = await self._read_pin(target, comment_limit)
         else:
             rendered = await self._read_question(target, comment_limit)
 
@@ -637,6 +648,136 @@ class ZhihuReader:
             comments_complete=comments.error is None,
         )
 
+    async def _read_pin(
+        self, target: ZhihuTarget, comment_limit: int
+    ) -> _RenderedDocument:
+        payload = await self._fetch_json(f"/api/v4/pins/{target.resource_id}")
+        if payload.get("is_deleted") is True:
+            reason = html_to_text(payload.get("deleted_reason"))
+            raise ZhihuRequestError(reason or "The Zhihu thought was deleted.")
+
+        content = self._pin_content(payload)
+        if not content:
+            raise ZhihuRequestError(
+                "The Zhihu thought did not contain readable content."
+            )
+
+        reported_comments = self._integer(payload.get("comment_count"))
+        comments = await self._safe_comments(
+            "pin",
+            target.resource_id,
+            comment_limit,
+            expected_count=reported_comments,
+        )
+        lines = [
+            "[Zhihu thought]",
+            f"Author: {self._author_name(payload.get('author'))}",
+            f"Likes: {self._integer(payload.get('like_count'))}",
+            f"Reactions: {self._integer(payload.get('reaction_count'))}",
+            f"Reposts: {self._integer(payload.get('repin_count'))}",
+            f"Comment count: {reported_comments}",
+        ]
+        if payload.get("page_view_count") is not None:
+            lines.append(f"Views: {self._integer(payload.get('page_view_count'))}")
+        lines.extend(
+            [
+                f"Created: {self._timestamp(payload.get('created'))}",
+                f"Updated: {self._timestamp(payload.get('updated'))}",
+            ]
+        )
+        source_pin_id = self._positive_id(payload.get("source_pin_id"))
+        if source_pin_id is not None:
+            lines.append(
+                f"Repin source: https://www.zhihu.com/pin/{source_pin_id}"
+            )
+        lines.extend(
+            [
+                f"Source: {target.canonical_url}",
+                "",
+                "Thought:",
+                content,
+            ]
+        )
+        return _RenderedDocument(
+            self._compose_with_comments(lines, comments),
+            comments_complete=comments.error is None,
+        )
+
+    @classmethod
+    def _pin_content(cls, payload: Mapping[str, object]) -> str:
+        """Render structured pin blocks without serializing raw API objects."""
+        raw_blocks = payload.get("content")
+        rendered_blocks: list[str] = []
+        if isinstance(raw_blocks, list):
+            for raw_block in raw_blocks:
+                if not isinstance(raw_block, Mapping):
+                    continue
+                block_type = str(raw_block.get("type") or "").strip().lower()
+                if block_type == "text":
+                    title = html_to_text(raw_block.get("title"))
+                    body = html_to_text(
+                        raw_block.get("content") or raw_block.get("own_text")
+                    )
+                    text_parts = [part for part in (title, body) if part]
+                    if text_parts:
+                        rendered_blocks.append("\n".join(text_parts))
+                elif block_type == "image":
+                    label = html_to_text(
+                        raw_block.get("title") or raw_block.get("alt")
+                    )
+                    width = cls._integer(raw_block.get("width"))
+                    height = cls._integer(raw_block.get("height"))
+                    details = [part for part in (label,) if part]
+                    if width and height:
+                        details.append(f"{width}x{height}")
+                    rendered_blocks.append(
+                        f"[Image: {', '.join(details)}]" if details else "[Image]"
+                    )
+                elif block_type in {"link", "link_card"}:
+                    title = html_to_text(
+                        raw_block.get("data_draft_title")
+                        or raw_block.get("title")
+                    )
+                    target = str(
+                        raw_block.get("url")
+                        or raw_block.get("original_url")
+                        or raw_block.get("data_draft_url")
+                        or ""
+                    ).strip()
+                    label = "Link card" if block_type == "link_card" else "Link"
+                    details = [title] if title else []
+                    if target and target != title:
+                        details.append(target)
+                    rendered_blocks.append(
+                        f"[{label}: {' - '.join(details)}]"
+                        if details
+                        else f"[{label}]"
+                    )
+                elif block_type == "video":
+                    title = html_to_text(raw_block.get("title"))
+                    duration = cls._integer(raw_block.get("duration"))
+                    details = [part for part in (title,) if part]
+                    if duration:
+                        details.append(f"{duration} seconds")
+                    rendered_blocks.append(
+                        f"[Video: {', '.join(details)}]" if details else "[Video]"
+                    )
+                else:
+                    fallback = html_to_text(
+                        raw_block.get("content")
+                        or raw_block.get("title")
+                        or raw_block.get("description")
+                    )
+                    if fallback:
+                        rendered_blocks.append(fallback)
+
+        structured = "\n\n".join(rendered_blocks).strip()
+        if structured:
+            return structured
+        return html_to_text(
+            payload.get("content_html") or payload.get("excerpt_title")
+        )
+
     async def _read_question(
         self, target: ZhihuTarget, comment_limit: int
     ) -> _RenderedDocument:
@@ -828,6 +969,7 @@ class ZhihuReader:
         plural = {
             "answer": "answers",
             "article": "articles",
+            "pin": "pins",
             "question": "questions",
         }.get(kind)
         if plural is None:
@@ -838,7 +980,8 @@ class ZhihuReader:
         errors: list[str] = []
         seen_comment_ids: set[int] = set()
         captured_count = 0
-        offset = "0"
+        reported_count = expected_count
+        offset = ""
         seen_offsets = {offset}
         order_by = "score"
         for page_index in range(self._max_comment_pages):
@@ -857,6 +1000,10 @@ class ZhihuReader:
                     raise
                 errors.append(str(exc))
                 break
+            reported_count = max(
+                reported_count,
+                self._comment_total_count(payload),
+            )
             data = payload.get("data")
             if not isinstance(data, list):
                 errors.append("Zhihu returned an invalid comment list.")
@@ -877,6 +1024,10 @@ class ZhihuReader:
                         raise
                     errors.append(str(exc))
                     break
+                reported_count = max(
+                    reported_count,
+                    self._comment_total_count(payload),
+                )
                 data = payload.get("data")
                 if not isinstance(data, list):
                     errors.append("Zhihu returned an invalid comment list.")
@@ -938,7 +1089,7 @@ class ZhihuReader:
                 ):
                     initial_child_offset = self._normalize_comment_offset(
                         raw_comment.get("child_comment_next_offset")
-                    ) or "0"
+                    ) or ""
                     child_result = await self._read_child_comments(
                         root_comment_id,
                         remaining_children,
@@ -983,6 +1134,11 @@ class ZhihuReader:
                 break
             seen_offsets.add(next_offset)
             offset = next_offset
+        if reported_count > 0 and not comments and not errors:
+            errors.append(
+                f"Zhihu reports {reported_count} comments but returned no readable "
+                "comments."
+            )
         error = "; ".join(dict.fromkeys(errors)) if errors else None
         return _CommentsResult(tuple(comments), error=error)
 
@@ -992,7 +1148,7 @@ class ZhihuReader:
         child_limit: int,
         seen_ids: set[int],
         *,
-        initial_offset: str = "0",
+        initial_offset: str = "",
     ) -> _CommentsResult:
         """Fetch replies omitted from a comment_v5 root-comment response."""
         endpoint = (
@@ -1139,6 +1295,16 @@ class ZhihuReader:
         except (TypeError, ValueError, OverflowError):
             return None
         return parsed if 0 < parsed < 10**30 else None
+
+    @classmethod
+    def _comment_total_count(cls, payload: Mapping[str, object]) -> int:
+        counts = payload.get("counts")
+        count_value = (
+            counts.get("total_counts") if isinstance(counts, Mapping) else None
+        )
+        paging = payload.get("paging")
+        paging_value = paging.get("totals") if isinstance(paging, Mapping) else None
+        return max(cls._integer(count_value), cls._integer(paging_value))
 
     @staticmethod
     def _author_name(value: object) -> str:
