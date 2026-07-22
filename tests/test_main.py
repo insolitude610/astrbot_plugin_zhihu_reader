@@ -25,6 +25,7 @@ class FakeReader:
         cache_ttl: int = 600,
         max_comments: int = 10,
         max_output_chars: int = 8_000,
+        authenticated_article_fallback: bool = False,
     ) -> None:
         self.options = {
             "cookie": cookie,
@@ -32,6 +33,7 @@ class FakeReader:
             "cache_ttl": cache_ttl,
             "max_comments": max_comments,
             "max_output_chars": max_output_chars,
+            "authenticated_article_fallback": authenticated_article_fallback,
         }
         self.calls: list[tuple[str, bool, int]] = []
         self.closed = False
@@ -132,6 +134,9 @@ class ZhihuReaderPluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(plugin.max_content_chars, 8_000)
         self.assertEqual(plugin.max_inject_chars, 12_000)
         self.assertEqual(plugin.max_urls, 1)
+        self.assertFalse(
+            plugin.reader.options["authenticated_article_fallback"]
+        )
         self.assertEqual(len(plugin.reader.calls), 1)
         self.assertEqual(
             plugin.reader.calls[0],
@@ -171,6 +176,15 @@ class ZhihuReaderPluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("representative comment", source_part.text)
         self.assertTrue(
             event.get_extra(plugin_main._SKIP_AUTO_INJECT_KEY, False)
+        )
+
+    async def test_authenticated_article_fallback_config_is_forwarded(self) -> None:
+        plugin, _ = self.make_plugin(
+            {"authenticated_article_fallback": True}
+        )
+
+        self.assertTrue(
+            plugin.reader.options["authenticated_article_fallback"]
         )
 
     async def test_command_creates_conversation_when_missing(self) -> None:

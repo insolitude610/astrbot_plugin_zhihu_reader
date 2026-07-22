@@ -902,6 +902,672 @@ class ZhihuReaderTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Excerpt fallback", result)
         self.assertEqual(result.to_text(max_chars=10), str(result)[:10])
 
+    async def test_authenticated_article_page_fallback_reads_initial_data(
+        self,
+    ) -> None:
+        article_id = 2063248023589741612
+        requests: list[tuple[str, str]] = []
+        initial_data = {
+            "initialState": {
+                "entities": {
+                    "articles": {
+                        str(article_id): {
+                            "title": "VIP article",
+                            "author": {"name": "Member author"},
+                            "content": "<p>Complete member-only body.</p>",
+                            "comment_count": 0,
+                            "voteup_count": 8,
+                        }
+                    }
+                }
+            }
+        }
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append((request.url.host, request.url.path))
+            self.assertEqual(request.headers.get("cookie"), "z_c0=vip-cookie")
+            if request.url.host == "www.zhihu.com":
+                return json_response({}, status_code=403)
+            if request.url.host == "zhuanlan.zhihu.com":
+                self.assertIn("text/html", request.headers["accept"])
+                self.assertEqual(request.headers["sec-fetch-dest"], "document")
+                page = (
+                    "<!doctype html><html><body>"
+                    '<script id="js-initialData" type="text/json">'
+                    f"{json.dumps(initial_data)}"
+                    "</script></body></html>"
+                )
+                return httpx.Response(200, content=page.encode("utf-8"))
+            return json_response({}, status_code=404)
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
+            reader = ZhihuReader(
+                client=client,
+                cookie="z_c0=vip-cookie",
+                max_comments=0,
+                authenticated_article_fallback=True,
+            )
+            result = await reader.read(
+                f"https://zhuanlan.zhihu.com/p/{article_id}"
+            )
+
+        self.assertEqual(
+            requests,
+            [
+                ("www.zhihu.com", f"/api/v4/articles/{article_id}"),
+                ("zhuanlan.zhihu.com", f"/p/{article_id}"),
+            ],
+        )
+        self.assertIn("Title: VIP article", result)
+        self.assertIn("Complete member-only body.", result)
+        self.assertNotIn("Preview only", result)
+
+    async def test_paid_api_preview_uses_authorized_page_content(self) -> None:
+        article_id = 2063248023589741612
+        requested_hosts: list[str] = []
+        initial_data = {
+            "initialState": {
+                "entities": {
+                    "articles": {
+                        str(article_id): {
+                            "title": "Purchased article",
+                            "author": {"name": "Member author"},
+                            "content": "<p>The complete purchased article body.</p>",
+                            "is_paid": True,
+                            "has_purchased": True,
+                            "can_read": True,
+                            "comment_count": 0,
+                        }
+                    }
+                }
+            }
+        }
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requested_hosts.append(request.url.host)
+            if request.url.host == "www.zhihu.com":
+                return json_response(
+                    {
+                        "title": "Purchased article",
+                        "content": "<p>Visible teaser from the API.</p>",
+                        "excerpt": "<p>Visible teaser from the API.</p>",
+                        "is_paid": True,
+                        "has_purchased": False,
+                        "can_read": False,
+                        "comment_count": 0,
+                    }
+                )
+            if request.url.host == "zhuanlan.zhihu.com":
+                page = (
+                    '<script id="js-initialData" type="text/json">'
+                    f"{json.dumps(initial_data)}"
+                    "</script>"
+                )
+                return httpx.Response(200, content=page.encode("utf-8"))
+            return json_response({}, status_code=404)
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
+            reader = ZhihuReader(
+                client=client,
+                cookie="z_c0=vip-cookie",
+                max_comments=0,
+                authenticated_article_fallback=True,
+            )
+            result = await reader.read(
+                f"https://zhuanlan.zhihu.com/p/{article_id}"
+            )
+
+        self.assertEqual(requested_hosts, ["www.zhihu.com", "zhuanlan.zhihu.com"])
+        self.assertIn("The complete purchased article body.", result)
+        self.assertNotIn("Visible teaser from the API.", result)
+        self.assertNotIn("Access: Preview only", result)
+
+    async def test_paid_prompt_without_fallback_is_uncached_preview(self) -> None:
+        api_calls = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal api_calls
+            self.assertEqual(request.url.host, "www.zhihu.com")
+            api_calls += 1
+            return json_response(
+                {
+                    "title": "Paid preview",
+                    "content": "<p>开通盐选会员，阅读全文。</p>",
+                    "is_paid": True,
+                    "has_purchased": False,
+                    "comment_count": 0,
+                }
+            )
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
+            reader = ZhihuReader(
+                client=client,
+                cookie="z_c0=vip-cookie",
+                max_comments=0,
+                cache_ttl_seconds=60,
+                authenticated_article_fallback=False,
+            )
+            first = await reader.read("https://zhuanlan.zhihu.com/p/987")
+            second = await reader.read("https://zhuanlan.zhihu.com/p/987")
+
+        self.assertEqual(first, second)
+        self.assertEqual(api_calls, 2)
+        self.assertIn("Access: Preview only", first)
+        self.assertIn("Article preview:", first)
+        self.assertIn("开通盐选会员，阅读全文。", first)
+
+    async def test_locked_article_page_is_uncached_preview(self) -> None:
+        api_calls = 0
+        page_calls = 0
+        article_id = 987
+        initial_data = {
+            "initialState": {
+                "entities": {
+                    "articles": {
+                        str(article_id): {
+                            "title": "Still locked",
+                            "content": "<p>购买后解锁全文。</p>",
+                            "is_paid": True,
+                            "is_locked": True,
+                            "has_purchased": False,
+                            "comment_count": 0,
+                        }
+                    }
+                }
+            }
+        }
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal api_calls, page_calls
+            if request.url.host == "www.zhihu.com":
+                api_calls += 1
+                return json_response(
+                    {
+                        "title": "Still locked",
+                        "content": "<p>Visible API preview.</p>",
+                        "excerpt": "<p>Visible API preview.</p>",
+                        "is_paid": True,
+                        "can_read": False,
+                        "comment_count": 0,
+                    }
+                )
+            if request.url.host == "zhuanlan.zhihu.com":
+                page_calls += 1
+                page = (
+                    '<script id="js-initialData" type="text/json">'
+                    f"{json.dumps(initial_data)}"
+                    "</script>"
+                )
+                return httpx.Response(200, content=page.encode("utf-8"))
+            return json_response({}, status_code=404)
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
+            reader = ZhihuReader(
+                client=client,
+                cookie="z_c0=vip-cookie",
+                max_comments=0,
+                cache_ttl_seconds=60,
+                authenticated_article_fallback=True,
+            )
+            first = await reader.read(
+                f"https://zhuanlan.zhihu.com/p/{article_id}"
+            )
+            second = await reader.read(
+                f"https://zhuanlan.zhihu.com/p/{article_id}"
+            )
+
+        self.assertEqual(first, second)
+        self.assertEqual((api_calls, page_calls), (2, 2))
+        self.assertIn("Access: Preview only", first)
+        self.assertIn("Article preview:", first)
+
+    async def test_paid_page_without_entitlement_is_uncached_preview(self) -> None:
+        api_calls = 0
+        page_calls = 0
+        article_id = 987
+        initial_data = {
+            "initialState": {
+                "entities": {
+                    "articles": {
+                        str(article_id): {
+                            "title": "Unconfirmed paid access",
+                            "content": (
+                                "<p>A short opening scene that stops before the "
+                                "rest of the story.</p>"
+                            ),
+                            "is_paid": True,
+                            "comment_count": 0,
+                        }
+                    }
+                }
+            }
+        }
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal api_calls, page_calls
+            if request.url.host == "www.zhihu.com":
+                api_calls += 1
+                return json_response({}, status_code=403)
+            if request.url.host == "zhuanlan.zhihu.com":
+                page_calls += 1
+                page = (
+                    '<script id="js-initialData" type="text/json">'
+                    f"{json.dumps(initial_data)}"
+                    "</script>"
+                )
+                return httpx.Response(200, content=page.encode("utf-8"))
+            return json_response({}, status_code=404)
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
+            reader = ZhihuReader(
+                client=client,
+                cookie="z_c0=vip-cookie",
+                max_comments=0,
+                cache_ttl_seconds=60,
+                authenticated_article_fallback=True,
+            )
+            first = await reader.read(
+                f"https://zhuanlan.zhihu.com/p/{article_id}"
+            )
+            second = await reader.read(
+                f"https://zhuanlan.zhihu.com/p/{article_id}"
+            )
+
+        self.assertEqual(first, second)
+        self.assertEqual((api_calls, page_calls), (2, 2))
+        self.assertIn("Access: Preview only", first)
+        self.assertIn("Article preview:", first)
+        self.assertIn("A short opening scene", first)
+
+    async def test_authorized_paid_api_content_skips_page_fallback(self) -> None:
+        for access_field in ("has_purchased", "can_read"):
+            with self.subTest(access_field=access_field):
+                requested_hosts: list[str] = []
+
+                def handler(request: httpx.Request) -> httpx.Response:
+                    requested_hosts.append(request.url.host)
+                    if request.url.host == "www.zhihu.com":
+                        return json_response(
+                            {
+                                "title": "Authorized paid article",
+                                "content": "<p>Paid full body from the API.</p>",
+                                "is_paid": True,
+                                access_field: True,
+                                "comment_count": 0,
+                            }
+                        )
+                    return json_response({}, status_code=500)
+
+                async with httpx.AsyncClient(
+                    transport=httpx.MockTransport(handler)
+                ) as client:
+                    reader = ZhihuReader(
+                        client=client,
+                        cookie="z_c0=vip-cookie",
+                        max_comments=0,
+                        authenticated_article_fallback=True,
+                    )
+                    result = await reader.read(
+                        "https://zhuanlan.zhihu.com/p/987"
+                    )
+
+                self.assertEqual(requested_hosts, ["www.zhihu.com"])
+                self.assertIn("Paid full body from the API.", result)
+                self.assertNotIn("Access: Preview only", result)
+
+    async def test_positive_read_access_overrides_unpurchased_flag(self) -> None:
+        requested_hosts: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requested_hosts.append(request.url.host)
+            if request.url.host == "www.zhihu.com":
+                return json_response(
+                    {
+                        "title": "Readable subscription article",
+                        "content": "<p>The complete readable paid article.</p>",
+                        "is_paid": True,
+                        "has_purchased": False,
+                        "can_read": True,
+                        "comment_count": 0,
+                    }
+                )
+            return json_response({}, status_code=500)
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
+            reader = ZhihuReader(
+                client=client,
+                cookie="z_c0=vip-cookie",
+                max_comments=0,
+                authenticated_article_fallback=True,
+            )
+            result = await reader.read("https://zhuanlan.zhihu.com/p/987")
+
+        self.assertEqual(requested_hosts, ["www.zhihu.com"])
+        self.assertIn("The complete readable paid article.", result)
+        self.assertNotIn("Access: Preview only", result)
+
+    async def test_unreadable_purchased_api_teaser_is_uncached_preview(
+        self,
+    ) -> None:
+        api_calls = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal api_calls
+            self.assertEqual(request.url.host, "www.zhihu.com")
+            api_calls += 1
+            return json_response(
+                {
+                    "title": "Currently unreadable purchase",
+                    "content": (
+                        "<p>A brief introductory passage ending before the "
+                        "substantive discussion.</p>"
+                    ),
+                    "is_paid": True,
+                    "has_purchased": True,
+                    "can_read": False,
+                    "comment_count": 0,
+                }
+            )
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
+            reader = ZhihuReader(
+                client=client,
+                cookie="z_c0=vip-cookie",
+                max_comments=0,
+                cache_ttl_seconds=60,
+                authenticated_article_fallback=False,
+            )
+            first = await reader.read("https://zhuanlan.zhihu.com/p/987")
+            second = await reader.read("https://zhuanlan.zhihu.com/p/987")
+
+        self.assertEqual(first, second)
+        self.assertEqual(api_calls, 2)
+        self.assertIn("Access: Preview only", first)
+        self.assertIn("Article preview:", first)
+        self.assertIn("A brief introductory passage", first)
+
+    async def test_authorized_api_purchase_prompt_is_uncached_preview(
+        self,
+    ) -> None:
+        api_calls = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal api_calls
+            self.assertEqual(request.url.host, "www.zhihu.com")
+            api_calls += 1
+            return json_response(
+                {
+                    "title": "Misleading access flags",
+                    "content": "<p>开通盐选会员，解锁全文。</p>",
+                    "is_paid": True,
+                    "has_purchased": True,
+                    "can_read": True,
+                    "comment_count": 0,
+                }
+            )
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
+            reader = ZhihuReader(
+                client=client,
+                cookie="z_c0=vip-cookie",
+                max_comments=0,
+                cache_ttl_seconds=60,
+                authenticated_article_fallback=False,
+            )
+            first = await reader.read("https://zhuanlan.zhihu.com/p/987")
+            second = await reader.read("https://zhuanlan.zhihu.com/p/987")
+
+        self.assertEqual(first, second)
+        self.assertEqual(api_calls, 2)
+        self.assertIn("Access: Preview only", first)
+        self.assertIn("Article preview:", first)
+        self.assertIn("开通盐选会员，解锁全文。", first)
+
+    async def test_authenticated_article_fallback_is_opt_in(self) -> None:
+        requested_hosts: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requested_hosts.append(request.url.host)
+            return json_response({}, status_code=403)
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
+            reader = ZhihuReader(
+                client=client,
+                cookie="z_c0=vip-cookie",
+                max_comments=0,
+            )
+            with self.assertRaisesRegex(
+                ZhihuRequestError,
+                "Enable authenticated article fallback",
+            ):
+                await reader.read("https://zhuanlan.zhihu.com/p/987")
+
+        self.assertEqual(requested_hosts, ["www.zhihu.com"])
+
+    async def test_blocked_article_page_returns_uncached_preview(self) -> None:
+        api_calls = 0
+        page_calls = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal api_calls, page_calls
+            if request.url.host == "www.zhihu.com":
+                api_calls += 1
+                return json_response(
+                    {
+                        "title": "Preview article",
+                        "content": "",
+                        "excerpt": "<p>Visible preview.</p>",
+                    }
+                )
+            if request.url.host == "zhuanlan.zhihu.com":
+                page_calls += 1
+                return httpx.Response(403)
+            return json_response({}, status_code=404)
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
+            reader = ZhihuReader(
+                client=client,
+                cookie="z_c0=vip-cookie",
+                max_comments=0,
+                cache_ttl_seconds=60,
+                authenticated_article_fallback=True,
+            )
+            first = await reader.read("https://zhuanlan.zhihu.com/p/987")
+            second = await reader.read("https://zhuanlan.zhihu.com/p/987")
+
+        self.assertEqual(first, second)
+        self.assertEqual((api_calls, page_calls), (2, 2))
+        self.assertIn("Access: Preview only", first)
+        self.assertIn("Visible preview.", first)
+        self.assertIn("browser verification may be required", first)
+
+    async def test_article_page_challenge_is_not_executed(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.host == "www.zhihu.com":
+                return json_response({}, status_code=403)
+            if request.url.host == "zhuanlan.zhihu.com":
+                return httpx.Response(
+                    200,
+                    content=(
+                        '<html><head><meta id="zh-zse-ck" content="opaque">'
+                        "</head><body><script>challenge()</script></body></html>"
+                    ).encode("utf-8"),
+                )
+            return json_response({}, status_code=404)
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
+            reader = ZhihuReader(
+                client=client,
+                cookie="z_c0=vip-cookie",
+                max_comments=0,
+                authenticated_article_fallback=True,
+            )
+            with self.assertRaisesRegex(
+                ZhihuRequestError,
+                "interactive browser verification",
+            ):
+                await reader.read("https://zhuanlan.zhihu.com/p/987")
+
+    async def test_article_page_challenge_rejects_valid_initial_data(self) -> None:
+        article_id = 987
+        initial_data = {
+            "initialState": {
+                "entities": {
+                    "articles": {
+                        str(article_id): {
+                            "title": "Data behind challenge",
+                            "content": "<p>This must not be accepted.</p>",
+                            "has_purchased": True,
+                            "can_read": True,
+                        }
+                    }
+                }
+            }
+        }
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.host == "www.zhihu.com":
+                return json_response({}, status_code=403)
+            if request.url.host == "zhuanlan.zhihu.com":
+                page = (
+                    '<html><head><meta id="zh-zse-ck" content="opaque">'
+                    "</head><body>"
+                    '<script id="js-initialData" type="text/json">'
+                    f"{json.dumps(initial_data)}"
+                    "</script></body></html>"
+                )
+                return httpx.Response(200, content=page.encode("utf-8"))
+            return json_response({}, status_code=404)
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
+            reader = ZhihuReader(
+                client=client,
+                cookie="z_c0=vip-cookie",
+                max_comments=0,
+                authenticated_article_fallback=True,
+            )
+            with self.assertRaisesRegex(
+                ZhihuRequestError,
+                "interactive browser verification",
+            ):
+                await reader.read(
+                    f"https://zhuanlan.zhihu.com/p/{article_id}"
+                )
+
+    async def test_short_free_article_equal_to_excerpt_is_cached(self) -> None:
+        api_calls = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal api_calls
+            self.assertEqual(request.url.host, "www.zhihu.com")
+            api_calls += 1
+            return json_response(
+                {
+                    "title": "Short free article",
+                    "content": "<p>A complete short free article.</p>",
+                    "excerpt": "<p>A complete short free article.</p>",
+                    "is_paid": False,
+                    "comment_count": 0,
+                }
+            )
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
+            reader = ZhihuReader(
+                client=client,
+                cookie="z_c0=vip-cookie",
+                max_comments=0,
+                cache_ttl_seconds=60,
+                authenticated_article_fallback=True,
+            )
+            first = await reader.read("https://zhuanlan.zhihu.com/p/987")
+            second = await reader.read("https://zhuanlan.zhihu.com/p/987")
+
+        self.assertEqual(first, second)
+        self.assertEqual(api_calls, 1)
+        self.assertIn("Article:\nA complete short free article.", first)
+        self.assertNotIn("Access: Preview only", first)
+
+    async def test_article_page_redirect_is_not_followed(self) -> None:
+        requested_hosts: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requested_hosts.append(request.url.host)
+            if request.url.host == "www.zhihu.com":
+                return json_response({}, status_code=403)
+            return httpx.Response(
+                302,
+                headers={"Location": "https://attacker.example/private"},
+            )
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            follow_redirects=True,
+        ) as client:
+            reader = ZhihuReader(
+                client=client,
+                cookie="z_c0=vip-cookie",
+                max_comments=0,
+                authenticated_article_fallback=True,
+            )
+            with self.assertRaisesRegex(
+                ZhihuRequestError,
+                "redirect was not followed",
+            ):
+                await reader.read("https://zhuanlan.zhihu.com/p/987")
+
+        self.assertEqual(
+            requested_hosts,
+            ["www.zhihu.com", "zhuanlan.zhihu.com"],
+        )
+
+    async def test_article_page_response_size_limit_is_enforced(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.host == "www.zhihu.com":
+                return json_response({}, status_code=403)
+            return httpx.Response(200, content=b"x" * 1_000)
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
+            reader = ZhihuReader(
+                client=client,
+                cookie="z_c0=vip-cookie",
+                max_comments=0,
+                max_response_bytes=100,
+                authenticated_article_fallback=True,
+            )
+            with self.assertRaisesRegex(
+                ZhihuRequestError,
+                "safety limit",
+            ):
+                await reader.read("https://zhuanlan.zhihu.com/p/987")
+
     async def test_ttl_cache_avoids_duplicate_requests(self) -> None:
         calls = 0
         now = [100.0]
