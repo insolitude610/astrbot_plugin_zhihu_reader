@@ -160,8 +160,18 @@ class ZhihuReaderPlugin(Star):
             raise ValueError("unsupported Zhihu URL")
         try:
             parsed = parser(normalized)
-        except Exception as exc:
-            raise ValueError("unsupported Zhihu URL") from exc
+        except Exception:
+            parsed = None
+        if parsed is None:
+            extractor = getattr(reader_module, "extract_zhihu_urls", None)
+            candidates = extractor(normalized) if callable(extractor) else []
+            unique_candidates = list(dict.fromkeys(str(item) for item in candidates))
+            if len(unique_candidates) == 1:
+                normalized = unique_candidates[0]
+                try:
+                    parsed = parser(normalized)
+                except Exception as exc:
+                    raise ValueError("unsupported Zhihu URL") from exc
         if parsed is None:
             raise ValueError("unsupported Zhihu URL")
         canonical_url = getattr(parsed, "canonical_url", normalized)
@@ -202,14 +212,14 @@ class ZhihuReaderPlugin(Star):
             Bounded plain text.
 
         Raises:
-            ValueError: If the reader returned no usable text.
+            ZhihuRequestError: If the reader returned no usable text.
         """
         if hasattr(document, "to_text"):
             text = document.to_text(max_chars=self.max_content_chars)
         else:
             text = document
         if not isinstance(text, str) or not text.strip():
-            raise ValueError("empty Zhihu document")
+            raise reader_module.ZhihuRequestError("empty Zhihu document")
         return text.strip()[: self.max_content_chars]
 
     @staticmethod
@@ -318,11 +328,27 @@ class ZhihuReaderPlugin(Star):
             return
         if event.get_extra(_SKIP_AUTO_INJECT_KEY, False):
             return
-        if not isinstance(req.prompt, str) or not req.prompt.strip():
+        prompt_text = req.prompt if isinstance(req.prompt, str) else ""
+        extra_texts = [
+            part.text
+            for part in req.extra_user_content_parts
+            if isinstance(getattr(part, "text", None), str)
+            and getattr(part, "text", "").strip()
+        ]
+        if not prompt_text.strip() and not extra_texts:
             return
 
+        texts = [prompt_text, *extra_texts]
+        event_text = getattr(event, "message_str", "")
+        if isinstance(event_text, str) and event_text.strip():
+            texts.append(event_text)
+        for part in req.extra_user_content_parts:
+            part_text = getattr(part, "text", None)
+            if isinstance(part_text, str) and part_text.strip():
+                texts.append(part_text)
+
         try:
-            urls = self._extract_urls(req.prompt)[: self.max_urls]
+            urls = self._extract_urls("\n".join(texts))[: self.max_urls]
         except Exception as exc:
             logger.warning(
                 f"Zhihu URL extraction failed: {type(exc).__name__}"

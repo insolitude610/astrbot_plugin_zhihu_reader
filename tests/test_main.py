@@ -11,6 +11,7 @@ if str(PLUGIN_PARENT) not in sys.path:
     sys.path.insert(0, str(PLUGIN_PARENT))
 
 from astrbot.core.provider.entities import ProviderRequest
+from astrbot.core.agent.message import TextPart
 
 from astrbot_plugin_zhihu_reader import main as plugin_main
 from astrbot_plugin_zhihu_reader.reader import ZhihuDocument
@@ -146,6 +147,60 @@ class ZhihuReaderPluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(getattr(part, "_no_save", False))
         self.assertIn("temporary source body", part.text)
         self.assertLessEqual(len(part.text), 12_000)
+
+    async def test_auto_injection_reads_urls_from_quoted_content(self) -> None:
+        plugin, _ = self.make_plugin()
+        event = FakeEvent()
+        request = ProviderRequest(prompt="请总结这条引用")
+        request.extra_user_content_parts.append(
+            TextPart(
+                text="<Quoted Message>知乎链接：https://www.zhihu.com/pin/123</Quoted Message>"
+            )
+        )
+
+        await plugin.inject_zhihu_material(event, request)
+
+        self.assertEqual(
+            plugin.reader.calls[0],
+            ("https://www.zhihu.com/pin/123", True, 10),
+        )
+
+    async def test_command_accepts_markdown_wrapped_url(self) -> None:
+        plugin, _ = self.make_plugin()
+        event = FakeEvent()
+
+        results = [
+            result
+            async for result in plugin.read_zhihu_command(
+                event,
+                "[https://www.zhihu.com/pin/123](https://www.zhihu.com/pin/123)",
+            )
+        ]
+
+        self.assertIsInstance(results[0], ProviderRequest)
+        self.assertEqual(
+            plugin.reader.calls[0],
+            ("https://www.zhihu.com/pin/123", True, 10),
+        )
+
+    async def test_empty_document_is_reported_as_fetch_failure(self) -> None:
+        plugin, _ = self.make_plugin()
+        event = FakeEvent()
+
+        async def empty_read(*args: Any, **kwargs: Any) -> ZhihuDocument:
+            return ZhihuDocument("")
+
+        plugin.reader.read = empty_read
+        results = [
+            result
+            async for result in plugin.read_zhihu_command(
+                event,
+                "https://www.zhihu.com/pin/123",
+            )
+        ]
+
+        self.assertIn("知乎内容抓取失败", results[0])
+        self.assertNotIn("无法识别", results[0])
 
     async def test_command_requests_llm_in_current_conversation(self) -> None:
         plugin, conversation = self.make_plugin()

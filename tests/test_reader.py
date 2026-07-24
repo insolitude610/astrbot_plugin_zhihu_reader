@@ -109,6 +109,14 @@ class ParseZhihuUrlTests(unittest.TestCase):
             ],
         )
 
+    def test_extract_urls_handles_markdown_wrappers_and_duplicates(self) -> None:
+        url = "https://www.zhihu.com/question/123/answer/456"
+
+        self.assertEqual(
+            extract_zhihu_urls(f"[{url}]({url})"),
+            [url],
+        )
+
 
 class ZhihuReaderTests(unittest.IsolatedAsyncioTestCase):
     async def test_reads_answer_and_bounded_nested_comments(self) -> None:

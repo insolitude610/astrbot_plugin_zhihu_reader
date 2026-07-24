@@ -307,10 +307,18 @@ def extract_zhihu_urls(text: str) -> list[str]:
 
     urls: list[str] = []
     trailing = ".,;:!?)]}>\"'\u3002\uff0c\uff1b\uff1a\uff01\uff1f\uff09\u3011\u300b"
-    for match in re.finditer(r"https?://[^\s<>\"']+", text, flags=re.IGNORECASE):
+    # Keep Markdown/HTML wrappers outside the candidate. For example,
+    # ``[https://www.zhihu.com/pin/1](https://www.zhihu.com/pin/1)``
+    # contains two valid URL candidates rather than one malformed one.
+    for match in re.finditer(
+        r"https?://[^\s<>\[\]()\"']+",
+        text,
+        flags=re.IGNORECASE,
+    ):
         candidate = match.group(0).rstrip(trailing)
         if parse_url(candidate) is not None:
-            urls.append(candidate)
+            if candidate not in urls:
+                urls.append(candidate)
         if len(urls) >= 20:
             break
     return urls
