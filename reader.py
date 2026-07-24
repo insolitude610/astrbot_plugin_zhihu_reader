@@ -16,6 +16,7 @@ import httpx
 
 _LOGGER = logging.getLogger(__name__)
 _API_ORIGIN = "https://www.zhihu.com"
+_ARTICLE_ORIGIN = "https://zhuanlan.zhihu.com"
 _SUPPORTED_HOSTS = {"zhihu.com", "www.zhihu.com", "zhuanlan.zhihu.com"}
 _RESOURCE_ID = r"([1-9]\d{0,29})"
 _HARD_MAX_COMMENTS = 50
@@ -114,6 +115,7 @@ class _CommentsResult:
 class _RenderedDocument:
     text: str
     comments_complete: bool = True
+    cacheable: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,6 +190,47 @@ class _HTMLTextExtractor(HTMLParser):
     def handle_data(self, data: str) -> None:
         if not self._ignored_depth:
             self.parts.append(data)
+
+
+class _ArticleInitialDataParser(HTMLParser):
+    """Capture Zhihu's JSON initial-data script without executing page code."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.scripts: list[str] = []
+        self.has_zse_challenge = False
+        self._capturing = False
+        self._parts: list[str] = []
+
+    def handle_starttag(
+        self, tag: str, attrs: list[tuple[str, str | None]]
+    ) -> None:
+        attributes = {key.lower(): value for key, value in attrs}
+        if tag.lower() == "meta" and (
+            str(attributes.get("id") or "").lower() == "zh-zse-ck"
+        ):
+            self.has_zse_challenge = True
+        if tag.lower() != "script":
+            return
+        script_id = str(attributes.get("id") or "").lower()
+        if script_id == "js-initialdata":
+            self._capturing = True
+            self._parts = []
+
+    def handle_data(self, data: str) -> None:
+        if self._capturing:
+            self._parts.append(data)
+
+    def handle_startendtag(
+        self, tag: str, attrs: list[tuple[str, str | None]]
+    ) -> None:
+        self.handle_starttag(tag, attrs)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() == "script" and self._capturing:
+            self.scripts.append("".join(self._parts))
+            self._capturing = False
+            self._parts = []
 
 
 def html_to_text(value: object) -> str:
@@ -341,6 +384,7 @@ class ZhihuReader:
         max_output_chars: int = 30_000,
         cache_ttl_seconds: float = 300.0,
         max_cache_entries: int = 128,
+        authenticated_article_fallback: bool = False,
         clock: Callable[[], float] = time.monotonic,
         timeout: float | None = None,
         cache_ttl: float | None = None,
@@ -373,6 +417,10 @@ class ZhihuReader:
         self._max_output_chars = max_output_chars
         self._cache_ttl_seconds = cache_ttl_seconds
         self._max_cache_entries = max_cache_entries
+        self._authenticated_article_fallback = bool(
+            authenticated_article_fallback
+        )
+        self._configured_cookie = bool(cookie.strip())
         self._clock = clock
         self._cache: dict[str, _CacheEntry] = {}
         self._headers = {
@@ -445,7 +493,11 @@ class ZhihuReader:
             rendered = await self._read_question(target, comment_limit)
 
         result = self._truncate(rendered.text)
-        if self._cache_ttl_seconds > 0 and rendered.comments_complete:
+        if (
+            self._cache_ttl_seconds > 0
+            and rendered.comments_complete
+            and rendered.cacheable
+        ):
             expired_keys = [
                 key for key, entry in self._cache.items() if entry.expires_at <= now
             ]
@@ -568,6 +620,295 @@ class ZhihuReader:
                 headers=anonymous_headers,
             )
 
+    async def _fetch_authenticated_article_page(
+        self, target: ZhihuTarget
+    ) -> dict[str, Any]:
+        """Read one fixed Zhuanlan page using an explicitly configured Cookie."""
+        if not self._authenticated_article_fallback:
+            raise ZhihuRequestError(
+                "Authenticated article-page fallback is disabled."
+            )
+        if not self._configured_cookie:
+            raise ZhihuRequestError(
+                "Authenticated article-page fallback requires a complete browser "
+                "Cookie."
+            )
+
+        request_url = f"{_ARTICLE_ORIGIN}/p/{target.resource_id}"
+        headers = dict(self._headers)
+        headers.update(
+            {
+                "Accept": (
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                    "image/avif,image/webp,*/*;q=0.8"
+                ),
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.7",
+                "Referer": "https://zhuanlan.zhihu.com/",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "same-origin",
+                "Upgrade-Insecure-Requests": "1",
+            }
+        )
+
+        try:
+            async with self._client.stream(
+                "GET",
+                request_url,
+                headers=headers,
+                timeout=self._timeout,
+                follow_redirects=False,
+            ) as response:
+                if response.is_redirect:
+                    raise ZhihuRequestError(
+                        "Zhihu redirected the authenticated article page; the "
+                        "redirect was not followed."
+                    )
+                if response.status_code == 401:
+                    raise ZhihuRequestError(
+                        "Zhihu rejected the configured login Cookie. Refresh the "
+                        "complete Cookie from a browser that can open the article."
+                    )
+                if response.status_code == 403:
+                    raise ZhihuRequestError(
+                        "Zhihu blocked the authenticated article page. The account "
+                        "may lack access, the Cookie may be incomplete, or browser "
+                        "verification may be required."
+                    )
+                if response.status_code == 404:
+                    raise ZhihuRequestError(
+                        "The requested Zhihu article page was not found."
+                    )
+                if response.status_code == 429:
+                    raise ZhihuRequestError(
+                        "Zhihu is rate limiting article-page requests. Please try "
+                        "again later."
+                    )
+                if response.status_code < 200 or response.status_code >= 300:
+                    raise ZhihuRequestError(
+                        f"Zhihu returned HTTP {response.status_code} for the "
+                        "article page."
+                    )
+
+                content_length = response.headers.get("Content-Length")
+                if content_length:
+                    try:
+                        if int(content_length) > self._max_response_bytes:
+                            raise ZhihuRequestError(
+                                "Zhihu returned more article-page data than the "
+                                "configured safety limit."
+                            )
+                    except ValueError:
+                        pass
+
+                body = bytearray()
+                async for chunk in response.aiter_bytes():
+                    body.extend(chunk)
+                    if len(body) > self._max_response_bytes:
+                        raise ZhihuRequestError(
+                            "Zhihu returned more article-page data than the "
+                            "configured safety limit."
+                        )
+        except ZhihuReaderError:
+            raise
+        except httpx.TimeoutException as exc:
+            raise ZhihuRequestError(
+                "Reading the authenticated Zhihu article page timed out."
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise ZhihuRequestError(
+                "Could not connect to the authenticated Zhihu article page."
+            ) from exc
+
+        try:
+            page_html = body.decode("utf-8-sig")
+        except UnicodeDecodeError as exc:
+            raise ZhihuRequestError(
+                "Zhihu returned an article page that could not be decoded."
+            ) from exc
+        return self._article_payload_from_html(page_html, target.resource_id)
+
+    @staticmethod
+    def _article_payload_from_html(
+        page_html: str, article_id: int
+    ) -> dict[str, Any]:
+        parser = _ArticleInitialDataParser()
+        try:
+            parser.feed(page_html)
+            parser.close()
+        except Exception as exc:
+            raise ZhihuRequestError(
+                "Zhihu returned an article page that could not be parsed."
+            ) from exc
+
+        if parser.has_zse_challenge:
+            raise ZhihuRequestError(
+                "Zhihu requires interactive browser verification for this article; "
+                "the plugin does not bypass that challenge."
+            )
+
+        for raw_script in parser.scripts:
+            try:
+                initial_data = json.loads(raw_script.strip())
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(initial_data, Mapping):
+                continue
+            state = initial_data.get("initialState")
+            if not isinstance(state, Mapping):
+                state = initial_data
+            entities = state.get("entities")
+            if not isinstance(entities, Mapping):
+                continue
+            articles = entities.get("articles")
+            if not isinstance(articles, Mapping):
+                continue
+            article = articles.get(str(article_id))
+            if isinstance(article, Mapping):
+                return dict(article)
+
+        raise ZhihuRequestError(
+            "The authenticated Zhihu page did not contain readable article data."
+        )
+
+    @classmethod
+    def _article_content_is_preview(
+        cls,
+        payload: Mapping[str, object],
+        content: str,
+    ) -> bool:
+        """Conservatively distinguish full article text from gated previews."""
+        access_containers: list[Mapping[str, object]] = [payload]
+        for key in (
+            "paid_info",
+            "permission",
+            "rights",
+            "access_info",
+            "purchase_info",
+        ):
+            value = payload.get(key)
+            if isinstance(value, Mapping):
+                access_containers.append(value)
+
+        readability_fields = {
+            "can_read",
+            "content_available",
+        }
+        entitlement_fields = {
+            "has_permission",
+            "has_purchased",
+            "has_rights",
+            "is_authorized",
+            "is_entitled",
+            "is_purchased",
+        }
+        restricted_fields = {
+            "content_limited",
+            "is_limited",
+            "is_locked",
+            "is_paywalled",
+            "is_preview",
+            "only_excerpt",
+            "requires_purchase",
+        }
+        paid_fields = {
+            "is_member_only",
+            "is_paid",
+            "is_paying",
+            "is_vip_content",
+            "requires_payment",
+        }
+
+        readability_granted = False
+        readability_denied = False
+        entitlement_granted = False
+        paid_content = False
+        explicitly_free = False
+
+        def flag_is(value: object, expected: bool) -> bool:
+            if isinstance(value, bool):
+                return value is expected
+            if isinstance(value, (int, float)):
+                return (value != 0) is expected
+            if isinstance(value, str):
+                normalized = value.strip().lower()
+                if normalized in {"true", "1", "yes"}:
+                    return expected
+                if normalized in {"false", "0", "no"}:
+                    return not expected
+            return False
+
+        for container in access_containers:
+            for key in readability_fields:
+                if key not in container:
+                    continue
+                value = container.get(key)
+                if flag_is(value, False):
+                    readability_denied = True
+                if flag_is(value, True):
+                    readability_granted = True
+            for key in entitlement_fields:
+                if key in container and flag_is(container.get(key), True):
+                    entitlement_granted = True
+            if any(flag_is(container.get(key), True) for key in restricted_fields):
+                return True
+            for key in paid_fields:
+                if key not in container:
+                    continue
+                value = container.get(key)
+                if flag_is(value, True):
+                    paid_content = True
+                elif key in {
+                    "is_member_only",
+                    "is_paid",
+                    "is_vip_content",
+                    "requires_payment",
+                } and flag_is(value, False):
+                    explicitly_free = True
+
+        if len(content) <= 2_000:
+            lowered = content.lower()
+            preview_markers = (
+                "查看完整内容",
+                "阅读全文",
+                "继续阅读",
+                "开通盐选",
+                "盐选会员",
+                "购买后",
+                "付费内容",
+                "解锁全文",
+                "subscribe to read",
+                "unlock the full",
+            )
+            if any(marker in lowered for marker in preview_markers):
+                return True
+
+        # Direct readability is authoritative. Purchase history can grant access
+        # only when Zhihu did not explicitly say the current content is unreadable.
+        if readability_denied:
+            return True
+        if readability_granted or entitlement_granted:
+            return False
+        if explicitly_free and not paid_content:
+            return False
+
+        excerpt = html_to_text(payload.get("excerpt"))
+        if excerpt:
+            normalized_content = re.sub(r"\s+", " ", content).strip()
+            normalized_excerpt = re.sub(r"\s+", " ", excerpt).strip()
+            similar_prefix = (
+                normalized_content.startswith(normalized_excerpt)
+                or normalized_excerpt.startswith(normalized_content)
+            )
+            if normalized_content == normalized_excerpt or (
+                similar_prefix
+                and len(normalized_content)
+                <= max(600, len(normalized_excerpt) * 2 + 100)
+            ):
+                return True
+
+        return paid_content
+
     async def _read_answer(
         self, target: ZhihuTarget, comment_limit: int
     ) -> _RenderedDocument:
@@ -616,19 +957,118 @@ class ZhihuReader:
     async def _read_article(
         self, target: ZhihuTarget, comment_limit: int
     ) -> _RenderedDocument:
-        payload = await self._fetch_json(
-            f"/api/v4/articles/{target.resource_id}",
-            params={
-                "include": (
-                    "content,excerpt,title,voteup_count,comment_count,created,"
-                    "updated,author.name"
-                )
-            },
-        )
-        content = html_to_text(payload.get("content") or payload.get("excerpt"))
-        if not content:
-            raise ZhihuRequestError("The Zhihu article did not contain readable text.")
+        payload: dict[str, Any] = {}
+        api_error: ZhihuRequestError | None = None
+        try:
+            payload = await self._fetch_json(
+                f"/api/v4/articles/{target.resource_id}",
+                params={
+                    "include": (
+                        "content,excerpt,title,voteup_count,comment_count,created,"
+                        "updated,author.name"
+                    )
+                },
+            )
+        except _ZhihuAccessDeniedError as exc:
+            api_error = exc
 
+        content = html_to_text(payload.get("content"))
+        content_is_preview = bool(
+            content and self._article_content_is_preview(payload, content)
+        )
+        if content and not content_is_preview:
+            return await self._render_article(
+                target,
+                payload,
+                comment_limit,
+                content,
+            )
+
+        excerpt = html_to_text(payload.get("excerpt"))
+        fallback_error: ZhihuRequestError | None = None
+        page_payload: dict[str, Any] = {}
+        page_content = ""
+        if self._authenticated_article_fallback and self._configured_cookie:
+            try:
+                page_payload = await self._fetch_authenticated_article_page(target)
+            except ZhihuRequestError as exc:
+                fallback_error = exc
+            else:
+                page_content = html_to_text(page_payload.get("content"))
+                page_is_preview = bool(
+                    page_content
+                    and self._article_content_is_preview(
+                        page_payload,
+                        page_content,
+                    )
+                )
+                if page_content and not page_is_preview:
+                    merged_payload = dict(payload)
+                    merged_payload.update(page_payload)
+                    return await self._render_article(
+                        target,
+                        merged_payload,
+                        comment_limit,
+                        page_content,
+                    )
+                if page_content:
+                    fallback_error = ZhihuRequestError(
+                        "The authenticated Zhihu page contained only an article "
+                        "preview."
+                    )
+                else:
+                    fallback_error = ZhihuRequestError(
+                        "The authenticated Zhihu page did not contain readable "
+                        "article text."
+                    )
+
+        preview_content = content or excerpt or page_content
+        if preview_content:
+            preview_payload = dict(payload)
+            if page_content and not content and not excerpt:
+                preview_payload.update(page_payload)
+            access_note = (
+                str(fallback_error)
+                if fallback_error is not None
+                else "Zhihu returned only a preview for this article."
+            )
+            return await self._render_article(
+                target,
+                preview_payload,
+                comment_limit,
+                preview_content,
+                preview=True,
+                access_note=access_note,
+            )
+
+        if fallback_error is not None:
+            raise fallback_error
+        if api_error is not None:
+            if not self._configured_cookie:
+                raise ZhihuRequestError(
+                    "Zhihu denied this article request. If the article requires "
+                    "an account, configure a complete browser Cookie."
+                ) from api_error
+            if not self._authenticated_article_fallback:
+                raise ZhihuRequestError(
+                    "Zhihu denied the article API. Enable authenticated article "
+                    "fallback to try the regular page with the configured Cookie."
+                ) from api_error
+            raise api_error
+        raise ZhihuRequestError(
+            "The Zhihu article did not contain readable text."
+        )
+
+    async def _render_article(
+        self,
+        target: ZhihuTarget,
+        payload: Mapping[str, object],
+        comment_limit: int,
+        content: str,
+        *,
+        preview: bool = False,
+        access_note: str | None = None,
+    ) -> _RenderedDocument:
         reported_comments = self._integer(payload.get("comment_count"))
         comments = await self._safe_comments(
             "article",
@@ -646,14 +1086,23 @@ class ZhihuReader:
             f"{self._timestamp(payload.get('created') or payload.get('created_time'))}",
             "Updated: "
             f"{self._timestamp(payload.get('updated') or payload.get('updated_time'))}",
-            f"Source: {target.canonical_url}",
-            "",
-            "Article:",
-            content,
         ]
+        if preview:
+            lines.append("Access: Preview only; the full article was not available.")
+        if access_note:
+            lines.append(f"Access detail: {access_note}")
+        lines.extend(
+            [
+                f"Source: {target.canonical_url}",
+                "",
+                "Article preview:" if preview else "Article:",
+                content,
+            ]
+        )
         return _RenderedDocument(
             self._compose_with_comments(lines, comments),
             comments_complete=comments.error is None,
+            cacheable=not preview,
         )
 
     async def _read_pin(

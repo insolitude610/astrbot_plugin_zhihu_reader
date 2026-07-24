@@ -93,6 +93,10 @@ class ZhihuReaderPlugin(Star):
             )
         if "max_output_chars" in reader_parameters:
             reader_options["max_output_chars"] = self.max_content_chars
+        if "authenticated_article_fallback" in reader_parameters:
+            reader_options["authenticated_article_fallback"] = bool(
+                self.config.get("authenticated_article_fallback", False)
+            )
         self.reader = ZhihuReader(**reader_options)
         read_parameters = inspect.signature(self.reader.read).parameters
         self._reader_accepts_comment_options = (

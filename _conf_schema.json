@@ -10,7 +10,13 @@
     "type": "text",
     "default": "",
     "obvious_hint": true,
-    "hint": "可选。部分内容或评论需要登录态，通常填入浏览器请求中的完整 Cookie。Cookie 属于敏感凭据，请勿分享。"
+    "hint": "可选。请从能够打开目标内容的浏览器请求中复制完整 Cookie，而不是只填单个静态 Token。Cookie 属于敏感凭据，请勿分享。"
+  },
+  "authenticated_article_fallback": {
+    "description": "使用登录态文章页面回退",
+    "type": "bool",
+    "default": false,
+    "hint": "当文章 API 被拒绝或只返回预览时，使用已配置 Cookie 请求固定的知乎文章页面并读取结构化正文。开启后，能向 Bot 发送链接的人可能间接读取该账号有权访问的文章。"
   },
   "include_comments": {
     "description": "读取评论",

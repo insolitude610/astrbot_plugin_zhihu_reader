@@ -15,6 +15,23 @@
 
 - 补充 README 中关于 Local Agent Runner、第三方 Agent Runner、消息引用和平台流式能力的说明。
 
+### 文档
+
+- 新增登录态付费文章回退的完整启用步骤，并重点说明账号权限暴露、完整 Cookie 保护、交互式风控限制和固定请求边界。
+- 说明付费预览不会作为完整正文缓存，以及成功读取的登录态全文会受进程内存缓存配置影响。
+
+## [0.3.0] - 2026-07-22
+
+### 新增
+
+- 新增默认关闭的登录态文章页面回退，在文章 API 被拒绝或只返回预览时，尝试使用完整浏览器 Cookie 读取知乎页面中的结构化正文。
+- 对仅有预览、登录失效、权限不足和浏览器验证分别给出安全诊断，预览结果不会写入正常缓存。
+
+### 安全
+
+- 登录态页面回退仅访问固定的知乎专栏文章路径，不跟随重定向，并继续执行响应大小和超时限制。
+- 不执行页面脚本，不逆向动态风控签名，也不在日志或输出中暴露 Cookie。
+
 ## [0.2.0] - 2026-07-22
 
 ### 新增
@@ -53,7 +70,8 @@
 - 将知乎内容标记为外部不可信资料，降低其中提示词影响模型指令的风险。
 - 避免在日志和公开仓库中记录可选的知乎 Cookie。
 
-[未发布]: https://github.com/insolitude610/astrbot_plugin_zhihu_reader/compare/v0.2.0...HEAD
+[未发布]: https://github.com/insolitude610/astrbot_plugin_zhihu_reader/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/insolitude610/astrbot_plugin_zhihu_reader/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/insolitude610/astrbot_plugin_zhihu_reader/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/insolitude610/astrbot_plugin_zhihu_reader/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/insolitude610/astrbot_plugin_zhihu_reader/releases/tag/v0.1.0
